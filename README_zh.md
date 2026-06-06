@@ -32,6 +32,7 @@ rustshell [OPTIONS] --id <ID> --server <SERVER>
   -p, --port <PORT>          ID 服务器端口 [默认: 21116]
   -k, --key <KEY>            许可证密钥 [默认: 内置公钥]
   -w, --password <PASSWORD>  设备密码 (留空则交互式输入)
+  -q, --quit-key <CHAR>      退出组合键字母 [默认: q]
   -d, --debug                启用调试日志
   -h, --help                 打印帮助
 ```
@@ -48,6 +49,7 @@ CLI 参数优先级高于环境变量。
 | `RUSTSHELL_PORT` | `--port` | ID 服务器端口 |
 | `RUSTSHELL_KEY` | `--key` | 许可证密钥 |
 | `RUSTSHELL_PASSWORD` | `--password` | 设备密码 |
+| `RUSTSHELL_QUIT_KEY` | `--quit-key` | 退出快捷键字母 (a-z) |
 | `RUSTSHELL_DEBUG` | `--debug` | 设为 `1` 或 `true` |
 
 ```bash
@@ -123,8 +125,9 @@ rustshell                         RustDesk 基础设施                 远程�
 
 | 按键 | 操作 |
 |------|------|
-| Ctrl+C | 关闭终端并退出 |
-| Ctrl+D | 关闭终端并退出 |
+| Ctrl+Q | 断开连接并退出（字母可通过 `--quit-key` 自定义） |
+| Ctrl+C | 发送到远端（可终止远端进程） |
+| Ctrl+D | 发送到远端（发送 EOF） |
 
 ## 故障排除
 
@@ -141,7 +144,7 @@ rustshell                         RustDesk 基础设施                 远程�
 
 **Windows 远端输入 `exit` 后连接挂起：**
 - 这是 RustDesk 服务端的[已知 bug](https://github.com/rustdesk/rustdesk/blob/caadd72ab2db8cc66e3d237e3e1cb60edbab7bc5/src/server/terminal_service.rs#L1267-L1270)：Windows ConPTY 在子进程退出时不发送 EOF 信号，导致服务端无法检测到会话已结束
-- **变通方案**：用 Ctrl+C 或 Ctrl+D 替代 `exit` 来关闭会话。这两种操作会发送显式的 `CloseTerminal` 消息，服务端能正确处理
+- **变通方案**：用 Ctrl+Q 替代 `exit` 来关闭会话。Ctrl+Q 会发送显式的 `CloseTerminal` 消息，服务端能正确处理
 - 此问题仅影响 Windows 远端；macOS 和 Linux 远端使用 `exit` 正常工作
 
 **空闲时连接断开：**

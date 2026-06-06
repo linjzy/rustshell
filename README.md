@@ -32,6 +32,7 @@ Options:
   -p, --port <PORT>          Rendezvous server port [default: 21116]
   -k, --key <KEY>            Licence key [default: built-in public key]
   -w, --password <PASSWORD>  Device password (omit for interactive prompt)
+  -q, --quit-key <CHAR>      Quit key letter for Ctrl+key combo [default: q]
   -d, --debug                Enable debug logging
   -h, --help                 Print help
 ```
@@ -48,6 +49,7 @@ CLI arguments take precedence when both are provided.
 | `RUSTSHELL_PORT` | `--port` | Rendezvous server port |
 | `RUSTSHELL_KEY` | `--key` | Licence key |
 | `RUSTSHELL_PASSWORD` | `--password` | Device password |
+| `RUSTSHELL_QUIT_KEY` | `--quit-key` | Quit key letter (a-z) |
 | `RUSTSHELL_DEBUG` | `--debug` | Set to `1` or `true` |
 
 ```bash
@@ -123,8 +125,9 @@ local terminal                                                     remote shell
 
 | Key | Action |
 |-----|--------|
-| Ctrl+C | Close terminal and exit |
-| Ctrl+D | Close terminal and exit |
+| Ctrl+Q | Disconnect and exit (letter customizable via `--quit-key`) |
+| Ctrl+C | Sent to remote (stop remote processes) |
+| Ctrl+D | Sent to remote (send EOF) |
 
 ## Troubleshooting
 
@@ -141,7 +144,7 @@ local terminal                                                     remote shell
 
 **Connection hangs after typing `exit` on Windows remote:**
 - This is a [known bug](https://github.com/rustdesk/rustdesk/blob/caadd72ab2db8cc66e3d237e3e1cb60edbab7bc5/src/server/terminal_service.rs#L1267-L1270) in the RustDesk server: Windows ConPTY does not signal EOF when the shell exits, so the server never detects the session has ended
-- **Workaround**: use Ctrl+C or Ctrl+D to close the session instead of typing `exit`. These send an explicit `CloseTerminal` message that the server handles correctly
+- **Workaround**: use Ctrl+Q to close the session instead of typing `exit`. This sends an explicit `CloseTerminal` message that the server handles correctly
 - This issue only affects Windows remotes; macOS and Linux remotes work correctly with `exit`
 
 **Connection drops after idle:**
