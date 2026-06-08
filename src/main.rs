@@ -25,7 +25,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Parser, Debug)]
 #[command(
     name = APP_NAME,
-    about = "Cross-platform remote shell via RustDesk",
+    version = VERSION,
+    about = concat!("Cross-platform remote shell via RustDesk v", env!("CARGO_PKG_VERSION")),
     after_help = "Environment variables (fallback when CLI arg not set):\n  \
                   RUSTSHELL_ID, RUSTSHELL_SERVER, RUSTSHELL_PORT, RUSTSHELL_KEY, \
                   RUSTSHELL_PASSWORD, RUSTSHELL_QUIT_KEY=(a-z), RUSTSHELL_DEBUG=(1|true)"
