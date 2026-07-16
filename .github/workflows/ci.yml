@@ -157,6 +157,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
+      - name: Install libsodium for ARM64
+        run: |
+          vcpkg install libsodium:arm64-windows
+          echo "SODIUM_LIB_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\arm64-windows\lib" >> $env:GITHUB_ENV
+          echo "SODIUM_INCLUDE_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\arm64-windows\include" >> $env:GITHUB_ENV
       - run: cargo build --release --target aarch64-pc-windows-msvc
       - run: cp target/aarch64-pc-windows-msvc/release/rustshell.exe rustshell-v${{ needs.check-version.outputs.version }}-windows-aarch64.exe
       - uses: softprops/action-gh-release@v2
