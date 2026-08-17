@@ -154,7 +154,10 @@ The protocol offset is 32-bit; for partial files beyond 4 GiB, resume safely
 starts at the largest representable offset. That protocol limit can retransmit
 and overwrite the tail after 4 GiB, but it preserves the first 4 GiB rather than
 restarting the whole file. Per-attempt byte accounting keeps automatic resume
-working even while that tail is being overwritten.
+working while that tail is being overwritten. If two such reconnects transfer
+data without raising the persisted high-water mark, the tool returns
+`chunk_fallback_required: true` so the client can switch to verified chunks
+instead of consuming all 32 reconnects.
 The MCP client timeout must still cover the whole transfer; for Codex, use for
 example:
 

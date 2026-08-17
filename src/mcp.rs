@@ -23,6 +23,7 @@ use tokio::{
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 const MAX_EXEC_TIMEOUT_SECONDS: u64 = 300;
 const MAX_FILE_RESUME_RECONNECTS: usize = 32;
+const MAX_SAME_HIGH_WATER_RECONNECTS: usize = 2;
 
 #[derive(Clone)]
 pub struct RustDeskMcp {
@@ -314,6 +315,7 @@ impl RustDeskMcp {
 
     async fn call_file_session(&self, device_id: &str, request: Value) -> Result<Value, String> {
         let mut resume_reconnects = 0;
+        let mut same_high_water_reconnects = 0;
         let mut initial_session_reused = None;
         let mut last_progress = file_request_progress(&request);
 
@@ -331,7 +333,18 @@ impl RustDeskMcp {
                 .and_then(Value::as_u64)
                 .unwrap_or_else(|| file_request_progress(&request));
             let made_progress = file_response_made_progress(&value, last_progress);
-            if can_resume && made_progress && resume_reconnects < MAX_FILE_RESUME_RECONNECTS {
+            if can_resume && file_response_only_replayed_u32_tail(&value, last_progress) {
+                same_high_water_reconnects += 1;
+            } else if progress > last_progress {
+                same_high_water_reconnects = 0;
+            }
+            let chunk_fallback_required =
+                same_high_water_reconnects >= MAX_SAME_HIGH_WATER_RECONNECTS;
+            if can_resume
+                && made_progress
+                && !chunk_fallback_required
+                && resume_reconnects < MAX_FILE_RESUME_RECONNECTS
+            {
                 last_progress = last_progress.max(progress);
                 resume_reconnects += 1;
                 continue;
@@ -347,13 +360,25 @@ impl RustDeskMcp {
                     Value::from(MAX_FILE_RESUME_RECONNECTS as u64),
                 );
                 object.insert(
+                    "same_high_water_reconnects".to_owned(),
+                    Value::from(same_high_water_reconnects as u64),
+                );
+                object.insert(
+                    "same_high_water_limit".to_owned(),
+                    Value::from(MAX_SAME_HIGH_WATER_RECONNECTS as u64),
+                );
+                object.insert(
+                    "chunk_fallback_required".to_owned(),
+                    Value::Bool(chunk_fallback_required),
+                );
+                object.insert(
                     "initial_session_reused".to_owned(),
                     Value::Bool(initial_session_reused.unwrap_or(false)),
                 );
                 object.insert("replayed".to_owned(), Value::Bool(false));
                 object.insert(
                     "resume_stalled".to_owned(),
-                    Value::Bool(can_resume && !made_progress),
+                    Value::Bool(can_resume && (!made_progress || chunk_fallback_required)),
                 );
                 object.insert(
                     "resume_exhausted".to_owned(),
@@ -381,6 +406,18 @@ fn file_response_made_progress(value: &Value, last_progress: u64) -> bool {
         .and_then(Value::as_u64)
         .is_some_and(|progress| progress > last_progress)
         || value
+            .get("attempt_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|attempt| attempt > 0)
+}
+
+fn file_response_only_replayed_u32_tail(value: &Value, last_progress: u64) -> bool {
+    last_progress > u64::from(u32::MAX)
+        && value
+            .get("progress_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|progress| progress <= last_progress)
+        && value
             .get("attempt_bytes")
             .and_then(Value::as_u64)
             .is_some_and(|attempt| attempt > 0)
@@ -478,7 +515,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_upload_file",
-        description = "Upload one local regular file, including large files, through the per-device reusable file-transfer session and return byte count, local SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file. Existing remote files are overwritten. Reuse the target resolved for the current task."
+        description = "Upload one local regular file, including large files, through the per-device reusable file-transfer session and return byte count, local SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file; two reconnects without a higher persisted byte count return chunk_fallback_required instead of looping. Existing remote files are overwritten. Reuse the target resolved for the current task."
     )]
     async fn upload_file(
         &self,
@@ -523,7 +560,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_download_file",
-        description = "Download one remote regular file, including large files, through the per-device reusable file-transfer session and return byte count, SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times; if stalled or exhausted, the partial file remains resumable on the next call. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file. Existing local files are overwritten. Reuse the target resolved for the current task."
+        description = "Download one remote regular file, including large files, through the per-device reusable file-transfer session and return byte count, SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times; if stalled or exhausted, the partial file remains resumable on the next call. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file; two reconnects without a higher persisted byte count return chunk_fallback_required instead of looping. Existing local files are overwritten. Reuse the target resolved for the current task."
     )]
     async fn download_file(
         &self,
@@ -575,8 +612,8 @@ impl RustDeskMcp {
 
 #[tool_handler(
     name = "rustdesk",
-    version = "0.5.2",
-    instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. File transfers have no server-side total-duration limit and fail after 300 seconds without protocol progress; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. A confirmed file-transfer disconnect may reconnect only after measurable transferred data, up to 32 times. RustDesk's 32-bit offset can retransmit the tail after 4 GiB but must not restart the whole file. Never replay a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
+    version = "0.5.3",
+    instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. File transfers have no server-side total-duration limit and fail after 300 seconds without protocol progress; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. A confirmed file-transfer disconnect may reconnect only after measurable transferred data, up to 32 times. RustDesk's 32-bit offset can retransmit the tail after 4 GiB but must not restart the whole file; after two reconnects without a higher persisted byte count, return chunk_fallback_required so the client can use terminal plus file channels for verified chunks. Never replay a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
 )]
 impl ServerHandler for RustDeskMcp {}
 
@@ -704,6 +741,14 @@ mod tests {
         assert!(file_response_made_progress(&response, previous_size));
         assert!(!file_response_made_progress(
             &json!({"progress_bytes": previous_size, "attempt_bytes": 0}),
+            previous_size
+        ));
+        assert!(file_response_only_replayed_u32_tail(
+            &response,
+            previous_size
+        ));
+        assert!(!file_response_only_replayed_u32_tail(
+            &json!({"progress_bytes": previous_size + 1, "attempt_bytes": 512}),
             previous_size
         ));
     }
