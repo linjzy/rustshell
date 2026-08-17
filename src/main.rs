@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use hbb_common::{
     bytes,
     config::{CONNECT_TIMEOUT, RELAY_PORT, RS_PUB_KEY},
-    log,
+    fs, log,
     message_proto::*,
     protobuf::Message as ProtoMessage,
     rendezvous_proto::{
@@ -15,10 +15,12 @@ use hbb_common::{
     Stream,
 };
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::{io::Write, path::PathBuf, time::Duration};
 
 const APP_NAME: &str = "RustShell";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const FILE_JOB_ID: i32 = 1;
+const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── CLI arguments ──────────────────────────────────────────────────
 
@@ -29,7 +31,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     about = concat!("Cross-platform remote shell via RustDesk v", env!("CARGO_PKG_VERSION")),
     after_help = "Environment variables (fallback when CLI arg not set):\n  \
                   RUSTSHELL_ID, RUSTSHELL_SERVER, RUSTSHELL_PORT, RUSTSHELL_KEY, \
-                  RUSTSHELL_PASSWORD, RUSTSHELL_QUIT_KEY=(a-z), RUSTSHELL_DEBUG=(1|true)"
+                  RUSTSHELL_PASSWORD, RUSTSHELL_QUIT_KEY=(a-z), RUSTSHELL_DEBUG=(1|true)\n\n  \
+                  With no subcommand, RustShell opens an interactive terminal."
 )]
 struct Args {
     #[arg(short = 'i', long, default_value = "")] id: String,
@@ -39,6 +42,15 @@ struct Args {
     #[arg(short = 'w', long, default_value = "")] password: String,
     #[arg(short = 'd', long, default_value = "false")] debug: bool,
     #[arg(short = 'q', long, default_value = "q")] quit_key: char,
+    #[command(subcommand)] command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Upload one local file to an exact path on the remote device.
+    Push { local: PathBuf, remote: String },
+    /// Download one remote file to an exact path on this device.
+    Pull { remote: String, local: PathBuf },
 }
 
 // ── Crypto helpers ─────────────────────────────────────────────────
@@ -256,7 +268,7 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all().build().expect("tokio runtime");
 
-    if let Err(e) = rt.block_on(run(args.id, args.key, args.server, args.port, password, args.quit_key)) {
+    if let Err(e) = rt.block_on(run(args.id, args.key, args.server, args.port, password, args.quit_key, args.command)) {
         let _ = crossterm::terminal::disable_raw_mode();
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
@@ -267,7 +279,9 @@ async fn run(
     device_id: String, licence_key: String,
     server: String, port: u16, password: String,
     quit_key: char,
+    command: Option<Command>,
 ) -> Result<()> {
+    let conn_type = if command.is_some() { ConnType::FILE_TRANSFER } else { ConnType::TERMINAL };
     let rendezvous_addr = format!("{}:{}", server, port);
     log::info!("Connecting to rendezvous server {}...", rendezvous_addr);
 
@@ -283,7 +297,7 @@ async fn run(
     let mut msg_out = RendezvousMessage::new();
     msg_out.set_punch_hole_request(PunchHoleRequest {
         id: device_id.clone(), licence_key: licence_key.clone(),
-        conn_type: ConnType::TERMINAL.into(),
+        conn_type: conn_type.into(),
         nat_type: NatType::SYMMETRIC.into(), force_relay: false,
         version: VERSION.to_owned(), ..Default::default()
     });
@@ -345,7 +359,7 @@ async fn run(
                 msg_out.set_request_relay(RequestRelay {
                     id: device_id.clone(), uuid: relay_uuid,
                     licence_key: licence_key.clone(),
-                    conn_type: ConnType::TERMINAL.into(), ..Default::default()
+                    conn_type: conn_type.into(), ..Default::default()
                 });
                 send_msg(&mut c, &msg_out, "request_relay").await?;
                 c
@@ -359,7 +373,7 @@ async fn run(
         msg_out.set_request_relay(RequestRelay {
             id: device_id.clone(), uuid: relay_uuid,
             licence_key: licence_key.clone(),
-            conn_type: ConnType::TERMINAL.into(), ..Default::default()
+            conn_type: conn_type.into(), ..Default::default()
         });
         send_msg(&mut c, &msg_out, "request_relay").await?;
         c
@@ -370,6 +384,9 @@ async fn run(
     let peer_sign_pk = if !peer_pk_from_server.is_empty() {
         let (vouched_id, pk) = decode_id_pk(&peer_pk_from_server, &rs_pk)
             .context("Failed to verify peer key from rendezvous")?;
+        if vouched_id != device_id {
+            bail!("Rendezvous vouched for device {vouched_id}, expected {device_id}");
+        }
         log::debug!("Peer key vouched: {}", vouched_id);
         Some(sign::PublicKey(pk))
     } else { None };
@@ -382,6 +399,9 @@ async fn run(
     let peer_sign_pk = peer_sign_pk
         .ok_or_else(|| anyhow::anyhow!("No peer public key from rendezvous server"))?;
     let (peer_id, their_pk) = decode_id_pk(&signed_id.id, &peer_sign_pk)?;
+    if peer_id != device_id {
+        bail!("Connected peer identity is {peer_id}, expected {device_id}");
+    }
     log::info!("Peer identity verified: {}", peer_id);
 
     let (av, sv, enc_key) = create_symmetric_key_msg(their_pk);
@@ -403,50 +423,389 @@ async fn run(
     h2.update(&h1.finalize()[..]); h2.update(hash.challenge.as_bytes());
     let pw_response: Vec<u8> = h2.finalize()[..].into();
 
-    // Phase 5: Login with Terminal
+    // Phase 5: Login with the requested RustDesk service.
     let mut lr = LoginRequest::new();
-    lr.username = device_id.clone(); lr.password = pw_response.into();
+    lr.username = device_id.clone();
+    lr.password = pw_response.into();
     lr.my_id = format!("RustShell-{}", std::process::id());
     lr.version = VERSION.to_owned();
     lr.my_platform = std::env::consts::OS.to_owned();
-    let mut terminal = Terminal::new();
-    terminal.service_id = format!("ts_{}", uuid::Uuid::new_v4());
-    lr.set_terminal(terminal);
+    if command.is_some() {
+        lr.set_file_transfer(FileTransfer::new());
+    } else {
+        let mut terminal = Terminal::new();
+        terminal.service_id = format!("ts_{}", uuid::Uuid::new_v4());
+        lr.set_terminal(terminal);
+    }
     let mut lr_msg = Message::new();
     lr_msg.set_login_request(lr);
     send_msg(&mut conn, &lr_msg, "login_request").await?;
     log::info!("Login request sent");
 
-    let bytes = recv_raw(&mut conn, "wait_login_response").await?;
-    log::debug!("Login response raw bytes ({}): {:02x?}", bytes.len(), bytes.as_ref());
-    // Some server versions send LoginResponse directly (not wrapped in Message).
-    // Try Message first, then fall back to raw LoginResponse.
-    let lr = match Message::parse_from_bytes(&bytes) {
-        Ok(m) => match m.union {
-            Some(message::Union::LoginResponse(lr)) => lr,
-            Some(message::Union::TerminalResponse(_)) => {
-                log::debug!("Early terminal response, proceeding");
-                LoginResponse::new()
-            }
-            _ => LoginResponse::parse_from_bytes(&bytes).unwrap_or_default(),
-        },
-        Err(_) => LoginResponse::parse_from_bytes(&bytes).unwrap_or_default(),
-    };
-    let mut remote_platform = String::new();
-    match lr.union {
-        Some(login_response::Union::Error(err)) if !err.is_empty() => bail!("Login failed: {}", err),
-        Some(login_response::Union::PeerInfo(pi)) => {
-            log::info!("Connected to {} ({} {})", pi.hostname, pi.platform, pi.version);
-            remote_platform = pi.platform;
+    let peer = wait_for_login(&mut conn).await?;
+    log::info!(
+        "Connected to {} ({} {})",
+        peer.hostname,
+        peer.platform,
+        peer.version
+    );
+
+    match command {
+        None => terminal_io_loop(&mut conn, &peer.platform, quit_key).await,
+        Some(Command::Push { local, remote }) => {
+            push_file(&mut conn, local, remote, &peer.version).await
         }
-        _ => {
-            log::debug!("Login accepted (no peer info, empty response)");
-            log::warn!("Server did not provide platform info — terminal access may be unsupported on this host");
+        Some(Command::Pull { remote, local }) => {
+            pull_file(&mut conn, remote, local, &peer.version).await
+        }
+    }
+}
+
+async fn wait_for_login(conn: &mut Stream) -> Result<PeerInfo> {
+    let deadline = time::Instant::now() + Duration::from_millis(CONNECT_TIMEOUT);
+    loop {
+        let bytes = time::timeout_at(deadline, recv_raw(conn, "wait_login_response"))
+            .await
+            .context("[wait_login_response] timeout")??;
+        log::debug!(
+            "Login response raw bytes ({}): {:02x?}",
+            bytes.len(),
+            bytes.as_ref()
+        );
+
+        match Message::parse_from_bytes(&bytes) {
+            Ok(message) => match message.union {
+                Some(message::Union::LoginResponse(response)) => {
+                    if let Some(peer) = peer_from_login_response(response)? {
+                        return Ok(peer);
+                    }
+                }
+                Some(message::Union::TestDelay(delay)) => {
+                    respond_to_test_delay(conn, delay).await?;
+                }
+                other => {
+                    log::debug!(
+                        "Ignoring message before authenticated PeerInfo: {:?}",
+                        other.map(|_| ())
+                    );
+                }
+            },
+            Err(message_error) => {
+                let response = LoginResponse::parse_from_bytes(&bytes)
+                    .with_context(|| format!("Invalid login response: {message_error}"))?;
+                if let Some(peer) = peer_from_login_response(response)? {
+                    return Ok(peer);
+                }
+            }
+        }
+    }
+}
+
+fn peer_from_login_response(response: LoginResponse) -> Result<Option<PeerInfo>> {
+    match response.union {
+        Some(login_response::Union::Error(error)) if !error.is_empty() => {
+            bail!("Login failed: {error}")
+        }
+        Some(login_response::Union::PeerInfo(peer)) => Ok(Some(peer)),
+        _ => Ok(None),
+    }
+}
+
+async fn respond_to_test_delay(conn: &mut Stream, delay: TestDelay) -> Result<()> {
+    if !delay.from_client {
+        let mut response = Message::new();
+        response.set_test_delay(delay);
+        send_msg(conn, &response, "test_delay_response").await?;
+    }
+    Ok(())
+}
+
+async fn push_file(
+    conn: &mut Stream,
+    local: PathBuf,
+    remote: String,
+    remote_version: &str,
+) -> Result<()> {
+    let metadata = std::fs::metadata(&local)
+        .with_context(|| format!("Cannot read local file {}", local.display()))?;
+    if !metadata.is_file() {
+        bail!("Push source is not a file: {}", local.display());
+    }
+    if remote.is_empty() {
+        bail!("Remote destination path cannot be empty");
+    }
+
+    let local_path = local
+        .to_str()
+        .context("Local source path is not valid UTF-8")?;
+    let overwrite_detection =
+        fs::can_enable_overwrite_detection(hbb_common::get_version_number(remote_version));
+    let job = fs::TransferJob::new_read(
+        FILE_JOB_ID,
+        fs::JobType::Generic,
+        remote.clone(),
+        fs::DataSource::FilePath(local.clone()),
+        0,
+        false,
+        false,
+        overwrite_detection,
+    )?;
+    if job.files().len() != 1 {
+        bail!("Only single-file uploads are supported: {local_path}");
+    }
+
+    let files = job.files().clone();
+    let total_size = job.total_size();
+    let request = fs::new_receive(FILE_JOB_ID, remote.clone(), 0, files, total_size);
+    send_msg(conn, &request, "push_request").await?;
+
+    let mut jobs = vec![job];
+    let mut ticker = time::interval(Duration::from_millis(1));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut transferred = 0;
+    let mut last_progress = time::Instant::now();
+    let mut local_done = false;
+
+    loop {
+        tokio::select! {
+            result = conn.next() => {
+                let bytes = match result {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(error)) => bail!("[push] stream error: {error}"),
+                    None => bail!("[push] connection closed by peer"),
+                };
+                let (made_progress, remote_done) =
+                    handle_push_message(conn, &mut jobs, bytes).await?;
+                if made_progress {
+                    last_progress = time::Instant::now();
+                }
+                if remote_done {
+                    if !local_done {
+                        bail!("Remote completed upload before all local data was sent");
+                    }
+                    break;
+                }
+            }
+            _ = ticker.tick(), if !local_done => {
+                fs::handle_read_jobs(&mut jobs, conn).await?;
+                let current = jobs.iter().map(|job| job.transferred()).sum();
+                if current != transferred || jobs.is_empty() {
+                    transferred = current;
+                    last_progress = time::Instant::now();
+                }
+                local_done = jobs.is_empty();
+            }
+            _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
+                bail!("Push made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs());
+            }
         }
     }
 
-    // Phase 6: Terminal I/O
-    terminal_io_loop(&mut conn, &remote_platform, quit_key).await
+    log::info!(
+        "Uploaded {} bytes: {} -> {}",
+        total_size,
+        local.display(),
+        remote
+    );
+    Ok(())
+}
+
+async fn handle_push_message(
+    conn: &mut Stream,
+    jobs: &mut [fs::TransferJob],
+    bytes: bytes::BytesMut,
+) -> Result<(bool, bool)> {
+    let message = Message::parse_from_bytes(&bytes).context("[push] invalid message")?;
+    match message.union {
+        Some(message::Union::TestDelay(delay)) => {
+            respond_to_test_delay(conn, delay).await?;
+            Ok((false, false))
+        }
+        Some(message::Union::FileAction(action)) => {
+            if let Some(file_action::Union::SendConfirm(confirm)) = action.union {
+                if confirm.id == FILE_JOB_ID {
+                    let job = fs::get_job(FILE_JOB_ID, jobs)
+                        .context("Push confirmation arrived after the job ended")?;
+                    job.confirm(&confirm).await;
+                    return Ok((true, false));
+                }
+            }
+            Ok((false, false))
+        }
+        Some(message::Union::FileResponse(response)) => match response.union {
+            Some(file_response::Union::Digest(digest)) if digest.id == FILE_JOB_ID => {
+                let confirm = FileTransferSendConfirmRequest {
+                    id: FILE_JOB_ID,
+                    file_num: digest.file_num,
+                    union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
+                    ..Default::default()
+                };
+                let job = fs::get_job(FILE_JOB_ID, jobs)
+                    .context("Push digest arrived after the job ended")?;
+                job.confirm(&confirm).await;
+                send_msg(
+                    conn,
+                    &fs::new_send_confirm(confirm),
+                    "push_overwrite_confirm",
+                )
+                .await?;
+                Ok((true, false))
+            }
+            Some(file_response::Union::Done(done)) if done.id == FILE_JOB_ID => Ok((true, true)),
+            Some(file_response::Union::Error(error)) if error.id == FILE_JOB_ID => {
+                bail!("Remote upload failed: {}", error.error)
+            }
+            _ => Ok((false, false)),
+        },
+        Some(message::Union::LoginResponse(response)) => {
+            peer_from_login_response(response)?;
+            Ok((false, false))
+        }
+        Some(message::Union::MessageBox(message)) if message.msgtype == "error" => {
+            bail!("Remote upload failed: {}", message.text)
+        }
+        _ => Ok((false, false)),
+    }
+}
+
+async fn pull_file(
+    conn: &mut Stream,
+    remote: String,
+    local: PathBuf,
+    remote_version: &str,
+) -> Result<()> {
+    if remote.is_empty() {
+        bail!("Remote source path cannot be empty");
+    }
+    if local.is_dir() {
+        bail!("Pull destination is a directory: {}", local.display());
+    }
+    let local_path = local
+        .to_str()
+        .context("Local destination path is not valid UTF-8")?;
+    let overwrite_detection =
+        fs::can_enable_overwrite_detection(hbb_common::get_version_number(remote_version));
+    let mut job = fs::TransferJob::new_write(
+        FILE_JOB_ID,
+        fs::JobType::Generic,
+        remote.clone(),
+        fs::DataSource::FilePath(local.clone()),
+        0,
+        false,
+        true,
+        overwrite_detection,
+    );
+
+    let request = fs::new_send(FILE_JOB_ID, fs::JobType::Generic, remote.clone(), 0, false);
+    send_msg(conn, &request, "pull_request").await?;
+
+    let result = pull_file_loop(conn, &mut job).await;
+    let expected_size = match result {
+        Ok(size) => size,
+        Err(error) => {
+            job.remove_download_file();
+            return Err(error);
+        }
+    };
+    job.modify_time();
+    drop(job);
+
+    let metadata = std::fs::metadata(&local)
+        .with_context(|| format!("Downloaded file was not finalized at {local_path}"))?;
+    if !metadata.is_file() || metadata.len() != expected_size {
+        bail!(
+            "Downloaded file size mismatch at {}: expected {}, got {}",
+            local.display(),
+            expected_size,
+            metadata.len()
+        );
+    }
+    log::info!(
+        "Downloaded {} bytes: {} -> {}",
+        expected_size,
+        remote,
+        local.display()
+    );
+    Ok(())
+}
+
+async fn pull_file_loop(conn: &mut Stream, job: &mut fs::TransferJob) -> Result<u64> {
+    let mut expected_size = None;
+    let mut last_progress = time::Instant::now();
+
+    loop {
+        tokio::select! {
+            result = conn.next() => {
+                let bytes = match result {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(error)) => bail!("[pull] stream error: {error}"),
+                    None => bail!("[pull] connection closed by peer"),
+                };
+                let message = Message::parse_from_bytes(&bytes).context("[pull] invalid message")?;
+                match message.union {
+                    Some(message::Union::TestDelay(delay)) => {
+                        respond_to_test_delay(conn, delay).await?;
+                    }
+                    Some(message::Union::FileResponse(response)) => match response.union {
+                        Some(file_response::Union::Dir(directory)) if directory.id == FILE_JOB_ID => {
+                            if expected_size.is_some() {
+                                bail!("Remote sent duplicate file metadata for pull job");
+                            }
+                            if directory.entries.len() != 1 {
+                                bail!(
+                                    "Pull supports one file, but the remote path contains {} entries",
+                                    directory.entries.len()
+                                );
+                            }
+                            let entry = &directory.entries[0];
+                            if entry.entry_type.enum_value() != Ok(FileType::File) {
+                                bail!("Remote source is not a regular file");
+                            }
+                            expected_size = Some(entry.size);
+                            job.set_files(directory.entries.to_vec())?;
+                            last_progress = time::Instant::now();
+                        }
+                        Some(file_response::Union::Digest(digest)) if digest.id == FILE_JOB_ID => {
+                            job.set_digest(digest.file_size, digest.last_modified);
+                            let confirm = FileTransferSendConfirmRequest {
+                                id: FILE_JOB_ID,
+                                file_num: digest.file_num,
+                                union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
+                                ..Default::default()
+                            };
+                            job.confirm(&confirm).await;
+                            send_msg(conn, &fs::new_send_confirm(confirm), "pull_overwrite_confirm").await?;
+                            last_progress = time::Instant::now();
+                        }
+                        Some(file_response::Union::Block(block)) if block.id == FILE_JOB_ID => {
+                            if expected_size.is_none() {
+                                bail!("Remote sent file data before file metadata");
+                            }
+                            job.write(block).await?;
+                            last_progress = time::Instant::now();
+                        }
+                        Some(file_response::Union::Done(done)) if done.id == FILE_JOB_ID => {
+                            return expected_size.context("Remote completed pull without file metadata");
+                        }
+                        Some(file_response::Union::Error(error)) if error.id == FILE_JOB_ID => {
+                            bail!("Remote download failed: {}", error.error)
+                        }
+                        _ => {}
+                    },
+                    Some(message::Union::LoginResponse(response)) => {
+                        peer_from_login_response(response)?;
+                    }
+                    Some(message::Union::MessageBox(message)) if message.msgtype == "error" => {
+                        bail!("Remote download failed: {}", message.text)
+                    }
+                    _ => {}
+                }
+            }
+            _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
+                bail!("Pull made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs());
+            }
+        }
+    }
 }
 
 // ── secure_tcp ─────────────────────────────────────────────────────
@@ -547,6 +906,9 @@ async fn terminal_io_loop(conn: &mut Stream, remote_platform: &str, quit_key: ch
                             _ => { log::debug!("TerminalResponse with empty union"); }
                         }
                     }
+                    Some(message::Union::TestDelay(delay)) => {
+                        respond_to_test_delay(conn, delay).await?;
+                    }
                     Some(message::Union::Hash(_)) => {}
                     other => { log::debug!("Unhandled message type: {:?}", other.map(|_| ())); }
                 }
@@ -600,4 +962,63 @@ async fn terminal_io_loop(conn: &mut Stream, remote_platform: &str, quit_key: ch
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_subcommand_keeps_terminal_mode() {
+        let args =
+            Args::try_parse_from(["rustshell", "--id", "123", "--server", "example.test"]).unwrap();
+
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn parses_push_paths() {
+        let args = Args::try_parse_from([
+            "rustshell",
+            "--id",
+            "123",
+            "--server",
+            "example.test",
+            "push",
+            "local.txt",
+            "C:\\Temp\\remote.txt",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::Push { local, remote }) => {
+                assert_eq!(local, PathBuf::from("local.txt"));
+                assert_eq!(remote, "C:\\Temp\\remote.txt");
+            }
+            _ => panic!("expected push command"),
+        }
+    }
+
+    #[test]
+    fn parses_pull_paths() {
+        let args = Args::try_parse_from([
+            "rustshell",
+            "--id",
+            "123",
+            "--server",
+            "example.test",
+            "pull",
+            "/tmp/remote.txt",
+            "local.txt",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::Pull { remote, local }) => {
+                assert_eq!(remote, "/tmp/remote.txt");
+                assert_eq!(local, PathBuf::from("local.txt"));
+            }
+            _ => panic!("expected pull command"),
+        }
+    }
 }

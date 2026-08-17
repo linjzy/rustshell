@@ -2,8 +2,8 @@
 
 [中文文档](README_zh.md)
 
-Cross-platform remote shell client. Connects to any device running RustDesk
-and opens a remote terminal session via the RustDesk relay infrastructure.
+Cross-platform remote shell and single-file transfer client. Connects to any
+device running RustDesk through the RustDesk relay infrastructure.
 
 Works on **Windows**, **macOS**, and **Linux**.
 
@@ -24,7 +24,11 @@ cargo build --release
 ## Usage
 
 ```
-rustshell [OPTIONS] --id <ID> --server <SERVER>
+rustshell [OPTIONS] [COMMAND]
+
+Commands:
+  push <LOCAL> <REMOTE>  Upload one file to an exact remote path
+  pull <REMOTE> <LOCAL>  Download one file to an exact local path
 
 Options:
   -i, --id <ID>              Remote device ID (required)
@@ -79,7 +83,39 @@ rustshell -i 123456789 -s myserver.example.com -k "MyKey..."
 
 # Debug mode for troubleshooting
 rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword -d
+
+# Upload to macOS
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  push ./report.txt /Users/name/Desktop/report.txt
+
+# Upload to Windows
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  push ./report.txt 'C:\Users\name\Desktop\report.txt'
+
+# Download from either platform
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  pull /Users/name/Desktop/report.txt ./report.txt
 ```
+
+`push` and `pull` currently transfer one regular file. Both destination
+arguments are full file paths, and an existing destination is overwritten.
+
+### Container image
+
+The fork publishes Linux images for amd64 and arm64 to
+`ghcr.io/linjzy/rustshell`. Mount the local files that should be transferred
+and allocate a TTY for interactive terminal sessions:
+
+```bash
+docker run --rm -it \
+  -v "$PWD:/data" -w /data \
+  -e RUSTSHELL_ID -e RUSTSHELL_SERVER -e RUSTSHELL_KEY -e RUSTSHELL_PASSWORD \
+  ghcr.io/linjzy/rustshell:latest \
+  push /data/report.txt /Users/name/Desktop/report.txt
+```
+
+The container is the RustShell client; the remote RustDesk device can be
+Windows, macOS, or Linux.
 
 ## How It Works
 
@@ -119,7 +155,7 @@ local terminal                                                     remote shell
 
 - Rust 1.75+
 - A running [RustDesk server](https://github.com/rustdesk/rustdesk-server) (hbbs + hbbr)
-- RustDesk running on the target device with terminal access enabled
+- RustDesk running on the target device with terminal or file-transfer access enabled
 
 ## Keyboard Shortcuts
 

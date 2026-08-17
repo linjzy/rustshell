@@ -2,8 +2,8 @@
 
 [English](README.md)
 
-跨平台远程 Shell 客户端。通过 RustDesk 中继基础设施连接任意运行
-RustDesk 的设备，并打开远程终端会话。
+跨平台远程 Shell 和单文件传输客户端。通过 RustDesk 中继基础设施连接
+任意运行 RustDesk 的设备。
 
 支持 **Windows**、**macOS**、**Linux**。
 
@@ -24,7 +24,11 @@ cargo build --release
 ## 用法
 
 ```
-rustshell [OPTIONS] --id <ID> --server <SERVER>
+rustshell [OPTIONS] [COMMAND]
+
+命令:
+  push <LOCAL> <REMOTE>  上传一个文件到远端完整路径
+  pull <REMOTE> <LOCAL>  从远端下载一个文件到本地完整路径
 
 选项:
   -i, --id <ID>              远程设备 ID
@@ -79,7 +83,39 @@ rustshell -i 123456789 -s myserver.example.com -k "MyKey..."
 
 # 调试模式
 rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword -d
+
+# 上传到 macOS
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  push ./report.txt /Users/name/Desktop/report.txt
+
+# 上传到 Windows
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  push ./report.txt 'C:\Users\name\Desktop\report.txt'
+
+# 从 macOS 或 Windows 下载
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  pull /Users/name/Desktop/report.txt ./report.txt
 ```
+
+`push` 和 `pull` 当前只传一个普通文件。目标参数必须是完整文件路径；
+目标已存在时会覆盖。
+
+### 容器镜像
+
+该 fork 会把 amd64 和 arm64 Linux 镜像发布到
+`ghcr.io/linjzy/rustshell`。运行时要挂载待传的本地文件；使用交互终端时
+需要分配 TTY：
+
+```bash
+docker run --rm -it \
+  -v "$PWD:/data" -w /data \
+  -e RUSTSHELL_ID -e RUSTSHELL_SERVER -e RUSTSHELL_KEY -e RUSTSHELL_PASSWORD \
+  ghcr.io/linjzy/rustshell:latest \
+  push /data/report.txt /Users/name/Desktop/report.txt
+```
+
+容器内运行的是 RustShell 客户端；远端 RustDesk 设备可以是 Windows、
+macOS 或 Linux。
 
 ## 工作原理
 
@@ -119,7 +155,7 @@ rustshell                         RustDesk 基础设施                 远程�
 
 - Rust 1.75+
 - 运行中的 [RustDesk 服务端](https://github.com/rustdesk/rustdesk-server) (hbbs + hbbr)
-- 目标设备上运行 RustDesk，且已开启终端访问权限
+- 目标设备上运行 RustDesk，且已开启终端或文件传输权限
 
 ## 快捷键
 
