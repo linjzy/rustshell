@@ -33,6 +33,7 @@ const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 struct TransferDisconnected {
     detail: String,
     progress_bytes: u64,
+    attempt_bytes: u64,
 }
 
 impl fmt::Display for TransferDisconnected {
@@ -58,9 +59,19 @@ fn disconnected_at(
     detail: impl fmt::Display,
     progress_bytes: u64,
 ) -> anyhow::Error {
+    disconnected_during(operation, detail, progress_bytes, 0)
+}
+
+fn disconnected_during(
+    operation: &str,
+    detail: impl fmt::Display,
+    progress_bytes: u64,
+    attempt_bytes: u64,
+) -> anyhow::Error {
     TransferDisconnected {
         detail: format!("[{operation}] {detail}"),
         progress_bytes,
+        attempt_bytes,
     }
     .into()
 }
@@ -73,6 +84,12 @@ pub(crate) fn transfer_disconnect_progress(error: &anyhow::Error) -> Option<u64>
     error
         .downcast_ref::<TransferDisconnected>()
         .map(|error| error.progress_bytes)
+}
+
+pub(crate) fn transfer_disconnect_attempt_bytes(error: &anyhow::Error) -> Option<u64> {
+    error
+        .downcast_ref::<TransferDisconnected>()
+        .map(|error| error.attempt_bytes)
 }
 
 pub(crate) fn file_resume_supported(remote_version: &str) -> bool {
@@ -714,11 +731,21 @@ async fn push_file(
             result = conn.next() => {
                 let bytes = match result {
                     Some(Ok(bytes)) => bytes,
-                    Some(Err(error)) => return Err(disconnected_at("push", format!("stream error: {error}"), finished_size)),
-                    None => return Err(disconnected_at("push", "connection closed by peer", finished_size)),
+                    Some(Err(error)) => return Err(disconnected_during(
+                        "push",
+                        format!("stream error: {error}"),
+                        finished_size,
+                        finished_size.saturating_sub(resumed_from),
+                    )),
+                    None => return Err(disconnected_during(
+                        "push",
+                        "connection closed by peer",
+                        finished_size,
+                        finished_size.saturating_sub(resumed_from),
+                    )),
                 };
                 let (made_progress, remote_done, confirmed_offset) =
-                    handle_push_message(conn, &mut jobs, bytes).await?;
+                    handle_push_message(conn, &mut jobs, bytes, resumed_from).await?;
                 if let Some(offset) = confirmed_offset {
                     resumed_from = resumed_from.max(offset);
                 }
@@ -733,9 +760,18 @@ async fn push_file(
                 }
             }
             _ = ticker.tick(), if !local_done => {
-                fs::handle_read_jobs(&mut jobs, conn)
-                    .await
-                    .map_err(|error| disconnected_at("push_send", error, finished_size))?;
+                if let Err(error) = fs::handle_read_jobs(&mut jobs, conn).await {
+                    let current_finished = jobs
+                        .iter()
+                        .map(|job| job.finished_size())
+                        .sum::<u64>();
+                    return Err(disconnected_during(
+                        "push_send",
+                        error,
+                        current_finished,
+                        current_finished.saturating_sub(resumed_from),
+                    ));
+                }
                 let current = jobs.iter().map(|job| job.transferred()).sum();
                 finished_size = if jobs.is_empty() {
                     total_size
@@ -751,13 +787,19 @@ async fn push_file(
             _ = keepalive.tick() => {
                 send_msg(conn, &Message::new(), "push_keepalive")
                     .await
-                    .map_err(|error| disconnected_at("push_keepalive", error, finished_size))?;
+                    .map_err(|error| disconnected_during(
+                        "push_keepalive",
+                        error,
+                        finished_size,
+                        finished_size.saturating_sub(resumed_from),
+                    ))?;
             }
             _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
-                return Err(disconnected_at(
+                return Err(disconnected_during(
                     "push",
                     format!("made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs()),
                     finished_size,
+                    finished_size.saturating_sub(resumed_from),
                 ));
             }
         }
@@ -779,6 +821,7 @@ async fn handle_push_message(
     conn: &mut Stream,
     jobs: &mut [fs::TransferJob],
     bytes: bytes::BytesMut,
+    resumed_from: u64,
 ) -> Result<(bool, bool, Option<u64>)> {
     let message = Message::parse_from_bytes(&bytes).context("[push] invalid message")?;
     match message.union {
@@ -786,7 +829,12 @@ async fn handle_push_message(
             let progress = jobs.iter().map(|job| job.finished_size()).sum();
             respond_to_test_delay(conn, delay)
                 .await
-                .map_err(|error| disconnected_at("push_test_delay", error, progress))?;
+                .map_err(|error| disconnected_during(
+                    "push_test_delay",
+                    error,
+                    progress,
+                    progress.saturating_sub(resumed_from),
+                ))?;
             Ok((false, false, None))
         }
         Some(message::Union::FileAction(action)) => {
@@ -944,6 +992,7 @@ async fn pull_file_loop(
 ) -> Result<(u64, u64)> {
     let mut expected_size = None;
     let mut resumed_from = 0;
+    let mut attempt_bytes = 0_u64;
     let mut last_progress = time::Instant::now();
     let mut keepalive = time::interval_at(
         time::Instant::now() + Duration::from_secs(15),
@@ -955,15 +1004,30 @@ async fn pull_file_loop(
             result = conn.next() => {
                 let bytes = match result {
                     Some(Ok(bytes)) => bytes,
-                    Some(Err(error)) => return Err(disconnected_at("pull", format!("stream error: {error}"), job.finished_size())),
-                    None => return Err(disconnected_at("pull", "connection closed by peer", job.finished_size())),
+                    Some(Err(error)) => return Err(disconnected_during(
+                        "pull",
+                        format!("stream error: {error}"),
+                        job.finished_size(),
+                        attempt_bytes,
+                    )),
+                    None => return Err(disconnected_during(
+                        "pull",
+                        "connection closed by peer",
+                        job.finished_size(),
+                        attempt_bytes,
+                    )),
                 };
                 let message = Message::parse_from_bytes(&bytes).context("[pull] invalid message")?;
                 match message.union {
                     Some(message::Union::TestDelay(delay)) => {
                         respond_to_test_delay(conn, delay)
                             .await
-                            .map_err(|error| disconnected_at("pull_test_delay", error, job.finished_size()))?;
+                            .map_err(|error| disconnected_during(
+                                "pull_test_delay",
+                                error,
+                                job.finished_size(),
+                                attempt_bytes,
+                            ))?;
                     }
                     Some(message::Union::FileResponse(response)) => match response.union {
                         Some(file_response::Union::Dir(directory)) if directory.id == FILE_JOB_ID => {
@@ -1017,7 +1081,12 @@ async fn pull_file_loop(
                             job.confirm(&confirm).await;
                             send_msg(conn, &fs::new_send_confirm(confirm), "pull_overwrite_confirm")
                                 .await
-                                .map_err(|error| disconnected_at("pull_confirm", error, job.finished_size()))?;
+                                .map_err(|error| disconnected_during(
+                                    "pull_confirm",
+                                    error,
+                                    job.finished_size(),
+                                    attempt_bytes,
+                                ))?;
                             resumed_from = resumed_from.max(offset);
                             last_progress = time::Instant::now();
                         }
@@ -1025,7 +1094,10 @@ async fn pull_file_loop(
                             if expected_size.is_none() {
                                 bail!("Remote sent file data before file metadata");
                             }
+                            let before = job.finished_size();
                             job.write(block).await?;
+                            attempt_bytes = attempt_bytes
+                                .saturating_add(job.finished_size().saturating_sub(before));
                             last_progress = time::Instant::now();
                         }
                         Some(file_response::Union::Done(done)) if done.id == FILE_JOB_ID => {
@@ -1051,13 +1123,19 @@ async fn pull_file_loop(
             _ = keepalive.tick() => {
                 send_msg(conn, &Message::new(), "pull_keepalive")
                     .await
-                    .map_err(|error| disconnected_at("pull_keepalive", error, job.finished_size()))?;
+                    .map_err(|error| disconnected_during(
+                        "pull_keepalive",
+                        error,
+                        job.finished_size(),
+                        attempt_bytes,
+                    ))?;
             }
             _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
-                return Err(disconnected_at(
+                return Err(disconnected_during(
                     "pull",
                     format!("made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs()),
                     job.finished_size(),
+                    attempt_bytes,
                 ));
             }
         }
@@ -1323,6 +1401,9 @@ mod tests {
         assert_eq!(transfer_disconnect_progress(&error), Some(0));
         let progressed = disconnected_at("pull", "connection closed", 42);
         assert_eq!(transfer_disconnect_progress(&progressed), Some(42));
+        assert_eq!(transfer_disconnect_attempt_bytes(&progressed), Some(0));
+        let attempted = disconnected_during("pull", "connection closed", 42, 7);
+        assert_eq!(transfer_disconnect_attempt_bytes(&attempted), Some(7));
     }
 
     #[test]

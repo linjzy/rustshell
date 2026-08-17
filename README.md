@@ -138,9 +138,9 @@ seconds idle and reconnect once on the next call. A terminal command interrupted
 by a disconnect is never replayed. A file transfer on RustDesk 1.4.2 or newer
 keeps its partial data and resumes at the confirmed byte offset after a
 mid-transfer disconnect, with at most 32 automatic reconnects per tool call and
-only while the persisted byte count keeps increasing. This never retransmits
-confirmed bytes or loops on zero progress; after the limit, the next explicit
-call can continue the preserved partial file. Tool results expose `session_channel`,
+only while each connection transfers data. This does not restart the whole file
+or loop on zero progress; after the limit, the next explicit call can continue
+the preserved partial file. Tool results expose `session_channel`,
 `session_reused`, `resumed_from`, `resume_reconnects`, and the exact completion
 stage in addition to the authenticated device identity and operation result.
 Both active upload and download loops send a protocol keepalive every 15 seconds,
@@ -151,8 +151,10 @@ stopped only by an explicit error or 300 seconds without protocol progress.
 RustShell reports RustDesk protocol version 1.4.9 independently from its own
 application version so that the peer enables digest and resume negotiation.
 The protocol offset is 32-bit; for partial files beyond 4 GiB, resume safely
-starts at the largest representable offset and overwrites only the remaining
-tail.
+starts at the largest representable offset. That protocol limit can retransmit
+and overwrite the tail after 4 GiB, but it preserves the first 4 GiB rather than
+restarting the whole file. Per-attempt byte accounting keeps automatic resume
+working even while that tail is being overwritten.
 The MCP client timeout must still cover the whole transfer; for Codex, use for
 example:
 

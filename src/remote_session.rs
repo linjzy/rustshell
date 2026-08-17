@@ -1,6 +1,7 @@
 use crate::{
     file_resume_supported, is_transfer_disconnected, peer_from_login_response, pull_file,
-    push_file, recv_raw, respond_to_test_delay, send_msg, transfer_disconnect_progress,
+    push_file, recv_raw, respond_to_test_delay, send_msg, transfer_disconnect_attempt_bytes,
+    transfer_disconnect_progress,
 };
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -513,6 +514,8 @@ pub(crate) async fn file_session_loop(
                         } else {
                             transfer_disconnect_progress(&error).unwrap_or(0)
                         };
+                        let attempt_bytes =
+                            transfer_disconnect_attempt_bytes(&error).unwrap_or(0);
                         let partial_preserved = resume_supported && progress_bytes > 0;
                         write_json_line(&serde_json::json!({
                             "ok": false,
@@ -528,6 +531,7 @@ pub(crate) async fn file_session_loop(
                             "resume_supported": resume_supported,
                             "partial_preserved": partial_preserved,
                             "progress_bytes": progress_bytes,
+                            "attempt_bytes": attempt_bytes,
                             "reconnect_on_next_call": disconnected
                         }))?;
                         return Err(error);
