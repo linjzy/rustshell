@@ -143,6 +143,8 @@ confirmed bytes or loops on zero progress; after the limit, the next explicit
 call can continue the preserved partial file. Tool results expose `session_channel`,
 `session_reused`, `resumed_from`, `resume_reconnects`, and the exact completion
 stage in addition to the authenticated device identity and operation result.
+Both active upload and download loops send a protocol keepalive every 15 seconds,
+so a receive-only download does not look idle to the relay while data is flowing.
 
 Large file transfers have no server-side total-duration limit. A transfer is
 stopped only by an explicit error or 300 seconds without protocol progress.

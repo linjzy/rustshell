@@ -136,6 +136,7 @@ rustshell mcp --wrapper /absolute/path/to/rustshell.sh
 不重传已确认字节，也不在零进度时循环。达到上限后保留分片，下一次显式调用可继续。
 工具结果会返回 `session_channel`、
 `session_reused`、`resumed_from`、`resume_reconnects`、已认证设备身份和准确完成阶段。
+上传和下载的活动传输循环都每 15 秒发送一次协议保活，避免只接收数据的下载被 relay 误判为空闲。
 
 大文件传输没有服务端总时长限制；只在明确失败或连续 300 秒没有协议进度时
 停止。RustShell 自身版本与握手上报的 RustDesk 1.4.9 协议版本彼此独立，以便

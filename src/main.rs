@@ -704,6 +704,10 @@ async fn push_file(
     let mut resumed_from = 0;
     let mut last_progress = time::Instant::now();
     let mut local_done = false;
+    let mut keepalive = time::interval_at(
+        time::Instant::now() + Duration::from_secs(15),
+        Duration::from_secs(15),
+    );
 
     loop {
         tokio::select! {
@@ -743,6 +747,11 @@ async fn push_file(
                     last_progress = time::Instant::now();
                 }
                 local_done = jobs.is_empty();
+            }
+            _ = keepalive.tick() => {
+                send_msg(conn, &Message::new(), "push_keepalive")
+                    .await
+                    .map_err(|error| disconnected_at("push_keepalive", error, finished_size))?;
             }
             _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
                 return Err(disconnected_at(
@@ -936,6 +945,10 @@ async fn pull_file_loop(
     let mut expected_size = None;
     let mut resumed_from = 0;
     let mut last_progress = time::Instant::now();
+    let mut keepalive = time::interval_at(
+        time::Instant::now() + Duration::from_secs(15),
+        Duration::from_secs(15),
+    );
 
     loop {
         tokio::select! {
@@ -1034,6 +1047,11 @@ async fn pull_file_loop(
                     }
                     _ => {}
                 }
+            }
+            _ = keepalive.tick() => {
+                send_msg(conn, &Message::new(), "pull_keepalive")
+                    .await
+                    .map_err(|error| disconnected_at("pull_keepalive", error, job.finished_size()))?;
             }
             _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
                 return Err(disconnected_at(

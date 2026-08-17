@@ -564,7 +564,7 @@ impl RustDeskMcp {
 
 #[tool_handler(
     name = "rustdesk",
-    version = "0.5.0",
+    version = "0.5.1",
     instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. File transfers have no server-side total-duration limit and fail after 300 seconds without protocol progress; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. A confirmed file-transfer disconnect may reconnect at the saved byte offset only after measurable progress, up to 32 times; this is resume, not replay. Never replay completed file bytes or a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
 )]
 impl ServerHandler for RustDeskMcp {}
