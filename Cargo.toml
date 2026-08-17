@@ -1,6 +1,6 @@
 [package]
 name = "rustshell"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Cross-platform remote shell, command execution, file transfer, and MCP server via RustDesk"
 license = "AGPL-3.0"

@@ -22,7 +22,7 @@ use tokio::{
 
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 const MAX_EXEC_TIMEOUT_SECONDS: u64 = 300;
-const FILE_TOOL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_FILE_RESUME_RECONNECTS: usize = 32;
 
 #[derive(Clone)]
 pub struct RustDeskMcp {
@@ -205,7 +205,7 @@ impl RustDeskMcp {
         channel: SessionChannel,
         device_id: &str,
         request: Value,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Value, String> {
         let slot = self.session_slot(channel, device_id).await;
         let mut session = slot.lock().await;
@@ -262,19 +262,25 @@ impl RustDeskMcp {
                     )
                 })
         };
-        let line = match tokio::time::timeout(timeout, exchange).await {
-            Ok(Ok(line)) => line,
-            Ok(Err(error)) => {
+        let response = match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, exchange).await {
+                Ok(response) => response,
+                Err(_) => {
+                    *session = None;
+                    return Err(format!(
+                        "{} session response exceeded {} seconds",
+                        channel.name(),
+                        timeout.as_secs()
+                    ));
+                }
+            },
+            None => exchange.await,
+        };
+        let line = match response {
+            Ok(line) => line,
+            Err(error) => {
                 *session = None;
                 return Err(error);
-            }
-            Err(_) => {
-                *session = None;
-                return Err(format!(
-                    "{} session response exceeded {} seconds",
-                    channel.name(),
-                    timeout.as_secs()
-                ));
             }
         };
         let mut value: Value = match serde_json::from_str(&line) {
@@ -305,6 +311,80 @@ impl RustDeskMcp {
         }
         Ok(value)
     }
+
+    async fn call_file_session(&self, device_id: &str, request: Value) -> Result<Value, String> {
+        let mut resume_reconnects = 0;
+        let mut initial_session_reused = None;
+        let mut last_progress = file_request_progress(&request);
+
+        loop {
+            let mut value = self
+                .call_session(SessionChannel::File, device_id, request.clone(), None)
+                .await?;
+            if initial_session_reused.is_none() {
+                initial_session_reused = value.get("session_reused").and_then(Value::as_bool);
+            }
+
+            let can_resume = file_response_can_resume(&value);
+            let progress = value
+                .get("progress_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| file_request_progress(&request));
+            let made_progress = progress > last_progress;
+            if can_resume && made_progress && resume_reconnects < MAX_FILE_RESUME_RECONNECTS {
+                last_progress = progress;
+                resume_reconnects += 1;
+                continue;
+            }
+
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "resume_reconnects".to_owned(),
+                    Value::from(resume_reconnects as u64),
+                );
+                object.insert(
+                    "automatic_resume_limit".to_owned(),
+                    Value::from(MAX_FILE_RESUME_RECONNECTS as u64),
+                );
+                object.insert(
+                    "initial_session_reused".to_owned(),
+                    Value::Bool(initial_session_reused.unwrap_or(false)),
+                );
+                object.insert("replayed".to_owned(), Value::Bool(false));
+                object.insert(
+                    "resume_stalled".to_owned(),
+                    Value::Bool(can_resume && !made_progress),
+                );
+                object.insert(
+                    "resume_exhausted".to_owned(),
+                    Value::Bool(
+                        can_resume
+                            && made_progress
+                            && resume_reconnects == MAX_FILE_RESUME_RECONNECTS,
+                    ),
+                );
+            }
+            return Ok(value);
+        }
+    }
+}
+
+fn file_response_can_resume(value: &Value) -> bool {
+    value.get("stage").and_then(Value::as_str) == Some("session_disconnected")
+        && value.get("resume_supported").and_then(Value::as_bool) == Some(true)
+        && value.get("partial_preserved").and_then(Value::as_bool) == Some(true)
+}
+
+fn file_request_progress(request: &Value) -> u64 {
+    if request.get("operation").and_then(Value::as_str) != Some("pull") {
+        return 0;
+    }
+    request
+        .get("local_path")
+        .and_then(Value::as_str)
+        .and_then(|path| std::fs::metadata(format!("{path}.download")).ok())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 #[tool_router]
@@ -371,7 +451,7 @@ impl RustDeskMcp {
                     "command": params.command,
                     "timeout_seconds": timeout_seconds
                 }),
-                Duration::from_secs(timeout_seconds + 15),
+                Some(Duration::from_secs(timeout_seconds + 15)),
             )
             .await
         {
@@ -387,7 +467,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_upload_file",
-        description = "Upload one local regular file through the per-device reusable file-transfer session and return byte count, local SHA-256, and whether the connection was reused. Existing remote files are overwritten. Reuse the target resolved for the current task; do not relist before each transfer."
+        description = "Upload one local regular file, including large files, through the per-device reusable file-transfer session and return byte count, local SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects at the saved byte offset only when progress increased, up to 32 times, never replaying completed bytes. Existing remote files are overwritten. Reuse the target resolved for the current task."
     )]
     async fn upload_file(
         &self,
@@ -406,15 +486,13 @@ impl RustDeskMcp {
         };
 
         let mut value = match self
-            .call_session(
-                SessionChannel::File,
+            .call_file_session(
                 &params.device_id,
                 json!({
                     "operation": "push",
                     "local_path": params.local_path.clone(),
                     "remote_path": params.remote_path.clone()
                 }),
-                FILE_TOOL_TIMEOUT,
             )
             .await
         {
@@ -434,7 +512,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_download_file",
-        description = "Download one remote regular file through the per-device reusable file-transfer session and return byte count, downloaded SHA-256, and whether the connection was reused. Existing local files are overwritten. Reuse the target resolved for the current task; do not relist before each transfer."
+        description = "Download one remote regular file, including large files, through the per-device reusable file-transfer session and return byte count, SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects at the saved byte offset only when progress increased, up to 32 times; if stalled or exhausted, the partial file remains resumable on the next call. Existing local files are overwritten. Reuse the target resolved for the current task."
     )]
     async fn download_file(
         &self,
@@ -451,15 +529,13 @@ impl RustDeskMcp {
         }
 
         let mut value = match self
-            .call_session(
-                SessionChannel::File,
+            .call_file_session(
                 &params.device_id,
                 json!({
                     "operation": "pull",
                     "local_path": params.local_path.clone(),
                     "remote_path": params.remote_path.clone()
                 }),
-                FILE_TOOL_TIMEOUT,
             )
             .await
         {
@@ -488,8 +564,8 @@ impl RustDeskMcp {
 
 #[tool_handler(
     name = "rustdesk",
-    version = "0.4.0",
-    instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. A dead or idle session reconnects on the next call. Never replay an in-flight operation after a disconnect, guess a menu index, request or log credentials, silently retry, or fall back to SSH."
+    version = "0.5.0",
+    instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. File transfers have no server-side total-duration limit and fail after 300 seconds without protocol progress; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. A confirmed file-transfer disconnect may reconnect at the saved byte offset only after measurable progress, up to 32 times; this is resume, not replay. Never replay completed file bytes or a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
 )]
 impl ServerHandler for RustDeskMcp {}
 
@@ -584,5 +660,25 @@ mod tests {
         let value = truncate_text("x".repeat(MAX_ERROR_BYTES + 10));
         assert!(value.ends_with("...<truncated>"));
         assert!(value.len() < MAX_ERROR_BYTES + 32);
+    }
+
+    #[test]
+    fn resumes_only_confirmed_disconnect_with_partial_data() {
+        assert!(file_response_can_resume(&json!({
+            "stage": "session_disconnected",
+            "resume_supported": true,
+            "partial_preserved": true,
+            "progress_bytes": 42
+        })));
+        assert!(!file_response_can_resume(&json!({
+            "stage": "transfer_failed",
+            "resume_supported": true,
+            "partial_preserved": true
+        })));
+        assert!(!file_response_can_resume(&json!({
+            "stage": "session_disconnected",
+            "resume_supported": true,
+            "partial_preserved": false
+        })));
     }
 }

@@ -134,10 +134,30 @@ Remote operations use a per-device dual session pool. Consecutive commands
 reuse one authenticated terminal connection; consecutive uploads and downloads
 reuse a separate authenticated file-transfer connection. The two RustDesk
 connection types cannot share one underlying session. Sessions close after 300
-seconds idle and reconnect once on the next call. An operation interrupted by a
-disconnect is never replayed automatically. Tool results expose
-`session_channel`, `session_reused`, and the exact completion stage in addition
-to the authenticated device identity and operation result.
+seconds idle and reconnect once on the next call. A terminal command interrupted
+by a disconnect is never replayed. A file transfer on RustDesk 1.4.2 or newer
+keeps its partial data and resumes at the confirmed byte offset after a
+mid-transfer disconnect, with at most 32 automatic reconnects per tool call and
+only while the persisted byte count keeps increasing. This never retransmits
+confirmed bytes or loops on zero progress; after the limit, the next explicit
+call can continue the preserved partial file. Tool results expose `session_channel`,
+`session_reused`, `resumed_from`, `resume_reconnects`, and the exact completion
+stage in addition to the authenticated device identity and operation result.
+
+Large file transfers have no server-side total-duration limit. A transfer is
+stopped only by an explicit error or 300 seconds without protocol progress.
+RustShell reports RustDesk protocol version 1.4.9 independently from its own
+application version so that the peer enables digest and resume negotiation.
+The protocol offset is 32-bit; for partial files beyond 4 GiB, resume safely
+starts at the largest representable offset and overwrites only the remaining
+tail.
+The MCP client timeout must still cover the whole transfer; for Codex, use for
+example:
+
+```toml
+[mcp_servers.rustdesk]
+tool_timeout_sec = 86400
+```
 
 ### Container image
 

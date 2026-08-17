@@ -15,7 +15,7 @@ use hbb_common::{
     Stream,
 };
 use sha2::{Digest, Sha256};
-use std::{io::Write, path::PathBuf, time::Duration};
+use std::{fmt, io::Write, path::PathBuf, time::Duration};
 
 mod mcp;
 mod remote_session;
@@ -23,17 +23,70 @@ mod remote_session;
 use remote_session::{command_session_loop, execute_command, file_session_loop, ExecResult};
 
 const APP_NAME: &str = "RustShell";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const RUSTDESK_PROTOCOL_VERSION: &str = "1.4.9";
 const FILE_JOB_ID: i32 = 1;
-const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const FILE_RESUME_MIN_VERSION: &str = "1.4.2";
+const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+struct TransferDisconnected {
+    detail: String,
+    progress_bytes: u64,
+}
+
+impl fmt::Display for TransferDisconnected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for TransferDisconnected {}
+
+#[derive(Debug)]
+pub(crate) struct FileTransferStats {
+    pub(crate) bytes: u64,
+    pub(crate) resumed_from: u64,
+}
+
+fn disconnected(operation: &str, detail: impl fmt::Display) -> anyhow::Error {
+    disconnected_at(operation, detail, 0)
+}
+
+fn disconnected_at(
+    operation: &str,
+    detail: impl fmt::Display,
+    progress_bytes: u64,
+) -> anyhow::Error {
+    TransferDisconnected {
+        detail: format!("[{operation}] {detail}"),
+        progress_bytes,
+    }
+    .into()
+}
+
+pub(crate) fn is_transfer_disconnected(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TransferDisconnected>().is_some()
+}
+
+pub(crate) fn transfer_disconnect_progress(error: &anyhow::Error) -> Option<u64> {
+    error
+        .downcast_ref::<TransferDisconnected>()
+        .map(|error| error.progress_bytes)
+}
+
+pub(crate) fn file_resume_supported(remote_version: &str) -> bool {
+    hbb_common::get_version_number(remote_version)
+        >= hbb_common::get_version_number(FILE_RESUME_MIN_VERSION)
+}
 
 // ── CLI arguments ──────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
     name = APP_NAME,
-    version = VERSION,
-    about = concat!("Cross-platform remote shell via RustDesk v", env!("CARGO_PKG_VERSION")),
+    version = APP_VERSION,
+    about = "Cross-platform remote shell via RustDesk protocol 1.4.9",
     after_help = "Environment variables (fallback when CLI arg not set):\n  \
                   RUSTSHELL_ID, RUSTSHELL_SERVER, RUSTSHELL_PORT, RUSTSHELL_KEY, \
                   RUSTSHELL_PASSWORD, RUSTSHELL_QUIT_KEY=(a-z), RUSTSHELL_DEBUG=(1|true)\n\n  \
@@ -351,7 +404,7 @@ async fn run(
         id: device_id.clone(), licence_key: licence_key.clone(),
         conn_type: conn_type.into(),
         nat_type: NatType::SYMMETRIC.into(), force_relay: false,
-        version: VERSION.to_owned(), ..Default::default()
+        version: RUSTDESK_PROTOCOL_VERSION.to_owned(), ..Default::default()
     });
     log::info!("Requesting connection to device {}...", device_id);
     send_msg(&mut socket, &msg_out, "punch_hole_request").await?;
@@ -480,7 +533,7 @@ async fn run(
     lr.username = device_id.clone();
     lr.password = pw_response.into();
     lr.my_id = format!("RustShell-{}", std::process::id());
-    lr.version = VERSION.to_owned();
+    lr.version = RUSTDESK_PROTOCOL_VERSION.to_owned();
     lr.my_platform = std::env::consts::OS.to_owned();
     if file_transfer {
         lr.set_file_transfer(FileTransfer::new());
@@ -606,7 +659,7 @@ async fn push_file(
     local: PathBuf,
     remote: String,
     remote_version: &str,
-) -> Result<()> {
+) -> Result<FileTransferStats> {
     let metadata = std::fs::metadata(&local)
         .with_context(|| format!("Cannot read local file {}", local.display()))?;
     if !metadata.is_file() {
@@ -621,7 +674,7 @@ async fn push_file(
         .context("Local source path is not valid UTF-8")?;
     let overwrite_detection =
         fs::can_enable_overwrite_detection(hbb_common::get_version_number(remote_version));
-    let job = fs::TransferJob::new_read(
+    let mut job = fs::TransferJob::new_read(
         FILE_JOB_ID,
         fs::JobType::Generic,
         remote.clone(),
@@ -634,16 +687,21 @@ async fn push_file(
     if job.files().len() != 1 {
         bail!("Only single-file uploads are supported: {local_path}");
     }
+    job.is_resume = file_resume_supported(remote_version);
 
     let files = job.files().clone();
     let total_size = job.total_size();
     let request = fs::new_receive(FILE_JOB_ID, remote.clone(), 0, files, total_size);
-    send_msg(conn, &request, "push_request").await?;
+    send_msg(conn, &request, "push_request")
+        .await
+        .map_err(|error| disconnected("push_request", error))?;
 
     let mut jobs = vec![job];
     let mut ticker = time::interval(Duration::from_millis(1));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut transferred = 0;
+    let mut finished_size = 0;
+    let mut resumed_from = 0;
     let mut last_progress = time::Instant::now();
     let mut local_done = false;
 
@@ -652,11 +710,14 @@ async fn push_file(
             result = conn.next() => {
                 let bytes = match result {
                     Some(Ok(bytes)) => bytes,
-                    Some(Err(error)) => bail!("[push] stream error: {error}"),
-                    None => bail!("[push] connection closed by peer"),
+                    Some(Err(error)) => return Err(disconnected_at("push", format!("stream error: {error}"), finished_size)),
+                    None => return Err(disconnected_at("push", "connection closed by peer", finished_size)),
                 };
-                let (made_progress, remote_done) =
+                let (made_progress, remote_done, confirmed_offset) =
                     handle_push_message(conn, &mut jobs, bytes).await?;
+                if let Some(offset) = confirmed_offset {
+                    resumed_from = resumed_from.max(offset);
+                }
                 if made_progress {
                     last_progress = time::Instant::now();
                 }
@@ -668,8 +729,15 @@ async fn push_file(
                 }
             }
             _ = ticker.tick(), if !local_done => {
-                fs::handle_read_jobs(&mut jobs, conn).await?;
+                fs::handle_read_jobs(&mut jobs, conn)
+                    .await
+                    .map_err(|error| disconnected_at("push_send", error, finished_size))?;
                 let current = jobs.iter().map(|job| job.transferred()).sum();
+                finished_size = if jobs.is_empty() {
+                    total_size
+                } else {
+                    jobs.iter().map(|job| job.finished_size()).sum()
+                };
                 if current != transferred || jobs.is_empty() {
                     transferred = current;
                     last_progress = time::Instant::now();
@@ -677,7 +745,11 @@ async fn push_file(
                 local_done = jobs.is_empty();
             }
             _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
-                bail!("Push made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs());
+                return Err(disconnected_at(
+                    "push",
+                    format!("made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs()),
+                    finished_size,
+                ));
             }
         }
     }
@@ -688,65 +760,103 @@ async fn push_file(
         local.display(),
         remote
     );
-    Ok(())
+    Ok(FileTransferStats {
+        bytes: total_size,
+        resumed_from,
+    })
 }
 
 async fn handle_push_message(
     conn: &mut Stream,
     jobs: &mut [fs::TransferJob],
     bytes: bytes::BytesMut,
-) -> Result<(bool, bool)> {
+) -> Result<(bool, bool, Option<u64>)> {
     let message = Message::parse_from_bytes(&bytes).context("[push] invalid message")?;
     match message.union {
         Some(message::Union::TestDelay(delay)) => {
-            respond_to_test_delay(conn, delay).await?;
-            Ok((false, false))
+            let progress = jobs.iter().map(|job| job.finished_size()).sum();
+            respond_to_test_delay(conn, delay)
+                .await
+                .map_err(|error| disconnected_at("push_test_delay", error, progress))?;
+            Ok((false, false, None))
         }
         Some(message::Union::FileAction(action)) => {
             if let Some(file_action::Union::SendConfirm(confirm)) = action.union {
                 if confirm.id == FILE_JOB_ID {
                     let job = fs::get_job(FILE_JOB_ID, jobs)
                         .context("Push confirmation arrived after the job ended")?;
+                    let offset = confirmed_offset(&confirm, job.total_size())?;
                     job.confirm(&confirm).await;
-                    return Ok((true, false));
+                    return Ok((true, false, Some(offset)));
                 }
             }
-            Ok((false, false))
+            Ok((false, false, None))
         }
         Some(message::Union::FileResponse(response)) => match response.union {
             Some(file_response::Union::Digest(digest)) if digest.id == FILE_JOB_ID => {
+                let job = fs::get_job(FILE_JOB_ID, jobs)
+                    .context("Push digest arrived after the job ended")?;
+                let offset = if job.is_resume && digest.is_identical {
+                    protocol_resume_offset(digest.transferred_size, job.total_size())?
+                } else {
+                    0
+                };
                 let confirm = FileTransferSendConfirmRequest {
                     id: FILE_JOB_ID,
                     file_num: digest.file_num,
-                    union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
+                    union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset)),
                     ..Default::default()
                 };
-                let job = fs::get_job(FILE_JOB_ID, jobs)
-                    .context("Push digest arrived after the job ended")?;
+                if offset > 0 {
+                    log::info!("Resuming upload at byte offset {offset}");
+                }
                 job.confirm(&confirm).await;
                 send_msg(
                     conn,
                     &fs::new_send_confirm(confirm),
                     "push_overwrite_confirm",
                 )
-                .await?;
-                Ok((true, false))
+                .await
+                .map_err(|error| {
+                    disconnected_at("push_confirm", error, job.finished_size())
+                })?;
+                Ok((true, false, Some(u64::from(offset))))
             }
-            Some(file_response::Union::Done(done)) if done.id == FILE_JOB_ID => Ok((true, true)),
+            Some(file_response::Union::Done(done)) if done.id == FILE_JOB_ID => {
+                Ok((true, true, None))
+            }
             Some(file_response::Union::Error(error)) if error.id == FILE_JOB_ID => {
                 bail!("Remote upload failed: {}", error.error)
             }
-            _ => Ok((false, false)),
+            _ => Ok((false, false, None)),
         },
         Some(message::Union::LoginResponse(response)) => {
             peer_from_login_response(response)?;
-            Ok((false, false))
+            Ok((false, false, None))
         }
         Some(message::Union::MessageBox(message)) if message.msgtype == "error" => {
             bail!("Remote upload failed: {}", message.text)
         }
-        _ => Ok((false, false)),
+        _ => Ok((false, false, None)),
     }
+}
+
+fn confirmed_offset(confirm: &FileTransferSendConfirmRequest, total_size: u64) -> Result<u64> {
+    let offset = match confirm.union.as_ref() {
+        Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset)) => u64::from(*offset),
+        _ => 0,
+    };
+    if offset > total_size {
+        bail!("Remote resume offset {offset} exceeds upload size {total_size}");
+    }
+    Ok(offset)
+}
+
+fn protocol_resume_offset(transferred_size: u64, total_size: u64) -> Result<u32> {
+    if transferred_size > total_size {
+        bail!("Resume size {transferred_size} exceeds file size {total_size}");
+    }
+    Ok(transferred_size.min(u64::from(u32::MAX)) as u32)
 }
 
 async fn pull_file(
@@ -754,7 +864,7 @@ async fn pull_file(
     remote: String,
     local: PathBuf,
     remote_version: &str,
-) -> Result<()> {
+) -> Result<FileTransferStats> {
     if remote.is_empty() {
         bail!("Remote source path cannot be empty");
     }
@@ -776,15 +886,20 @@ async fn pull_file(
         true,
         overwrite_detection,
     );
+    job.is_resume = file_resume_supported(remote_version);
 
     let request = fs::new_send(FILE_JOB_ID, fs::JobType::Generic, remote.clone(), 0, false);
-    send_msg(conn, &request, "pull_request").await?;
+    send_msg(conn, &request, "pull_request")
+        .await
+        .map_err(|error| disconnected("pull_request", error))?;
 
-    let result = pull_file_loop(conn, &mut job).await;
-    let expected_size = match result {
-        Ok(size) => size,
+    let result = pull_file_loop(conn, &mut job, local_path).await;
+    let (expected_size, resumed_from) = match result {
+        Ok(result) => result,
         Err(error) => {
-            job.remove_download_file();
+            if !job.is_resume {
+                job.remove_download_file();
+            }
             return Err(error);
         }
     };
@@ -807,11 +922,19 @@ async fn pull_file(
         remote,
         local.display()
     );
-    Ok(())
+    Ok(FileTransferStats {
+        bytes: expected_size,
+        resumed_from,
+    })
 }
 
-async fn pull_file_loop(conn: &mut Stream, job: &mut fs::TransferJob) -> Result<u64> {
+async fn pull_file_loop(
+    conn: &mut Stream,
+    job: &mut fs::TransferJob,
+    local_path: &str,
+) -> Result<(u64, u64)> {
     let mut expected_size = None;
+    let mut resumed_from = 0;
     let mut last_progress = time::Instant::now();
 
     loop {
@@ -819,13 +942,15 @@ async fn pull_file_loop(conn: &mut Stream, job: &mut fs::TransferJob) -> Result<
             result = conn.next() => {
                 let bytes = match result {
                     Some(Ok(bytes)) => bytes,
-                    Some(Err(error)) => bail!("[pull] stream error: {error}"),
-                    None => bail!("[pull] connection closed by peer"),
+                    Some(Err(error)) => return Err(disconnected_at("pull", format!("stream error: {error}"), job.finished_size())),
+                    None => return Err(disconnected_at("pull", "connection closed by peer", job.finished_size())),
                 };
                 let message = Message::parse_from_bytes(&bytes).context("[pull] invalid message")?;
                 match message.union {
                     Some(message::Union::TestDelay(delay)) => {
-                        respond_to_test_delay(conn, delay).await?;
+                        respond_to_test_delay(conn, delay)
+                            .await
+                            .map_err(|error| disconnected_at("pull_test_delay", error, job.finished_size()))?;
                     }
                     Some(message::Union::FileResponse(response)) => match response.union {
                         Some(file_response::Union::Dir(directory)) if directory.id == FILE_JOB_ID => {
@@ -848,14 +973,39 @@ async fn pull_file_loop(conn: &mut Stream, job: &mut fs::TransferJob) -> Result<
                         }
                         Some(file_response::Union::Digest(digest)) if digest.id == FILE_JOB_ID => {
                             job.set_digest(digest.file_size, digest.last_modified);
+                            let offset = match fs::is_write_need_confirmation(
+                                job.is_resume,
+                                local_path,
+                                &digest,
+                            )? {
+                                fs::DigestCheckResult::NeedConfirm(local_digest)
+                                    if local_digest.is_identical
+                                        && local_digest.transferred_size > 0
+                                        && local_digest.transferred_size <= digest.file_size =>
+                                {
+                                    u64::from(protocol_resume_offset(
+                                        local_digest.transferred_size,
+                                        digest.file_size,
+                                    )?)
+                                }
+                                _ => 0,
+                            };
                             let confirm = FileTransferSendConfirmRequest {
                                 id: FILE_JOB_ID,
                                 file_num: digest.file_num,
-                                union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
+                                union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(
+                                    offset as _,
+                                )),
                                 ..Default::default()
                             };
+                            if offset > 0 {
+                                log::info!("Resuming download at byte offset {offset}");
+                            }
                             job.confirm(&confirm).await;
-                            send_msg(conn, &fs::new_send_confirm(confirm), "pull_overwrite_confirm").await?;
+                            send_msg(conn, &fs::new_send_confirm(confirm), "pull_overwrite_confirm")
+                                .await
+                                .map_err(|error| disconnected_at("pull_confirm", error, job.finished_size()))?;
+                            resumed_from = resumed_from.max(offset);
                             last_progress = time::Instant::now();
                         }
                         Some(file_response::Union::Block(block)) if block.id == FILE_JOB_ID => {
@@ -866,7 +1016,10 @@ async fn pull_file_loop(conn: &mut Stream, job: &mut fs::TransferJob) -> Result<
                             last_progress = time::Instant::now();
                         }
                         Some(file_response::Union::Done(done)) if done.id == FILE_JOB_ID => {
-                            return expected_size.context("Remote completed pull without file metadata");
+                            return Ok((
+                                expected_size.context("Remote completed pull without file metadata")?,
+                                resumed_from,
+                            ));
                         }
                         Some(file_response::Union::Error(error)) if error.id == FILE_JOB_ID => {
                             bail!("Remote download failed: {}", error.error)
@@ -883,7 +1036,11 @@ async fn pull_file_loop(conn: &mut Stream, job: &mut fs::TransferJob) -> Result<
                 }
             }
             _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
-                bail!("Pull made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs());
+                return Err(disconnected_at(
+                    "pull",
+                    format!("made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs()),
+                    job.finished_size(),
+                ));
             }
         }
     }
@@ -1126,5 +1283,34 @@ mod tests {
         ]).unwrap();
 
         assert!(matches!(args.command, Some(Command::Mcp { .. })));
+    }
+
+    #[test]
+    fn file_resume_requires_rustdesk_1_4_2() {
+        assert!(!file_resume_supported("1.4.1"));
+        assert!(file_resume_supported("1.4.2"));
+        assert!(file_resume_supported("1.4.9"));
+    }
+
+    #[test]
+    fn app_and_rustdesk_protocol_versions_are_independent() {
+        assert_ne!(APP_VERSION, RUSTDESK_PROTOCOL_VERSION);
+        assert_eq!(RUSTDESK_PROTOCOL_VERSION, "1.4.9");
+    }
+
+    #[test]
+    fn transfer_disconnect_marker_survives_anyhow() {
+        let error = disconnected("pull", "connection closed");
+        assert!(is_transfer_disconnected(&error));
+        assert_eq!(transfer_disconnect_progress(&error), Some(0));
+        let progressed = disconnected_at("pull", "connection closed", 42);
+        assert_eq!(transfer_disconnect_progress(&progressed), Some(42));
+    }
+
+    #[test]
+    fn resume_offset_caps_files_larger_than_four_gib() {
+        let five_gib = 5 * 1024 * 1024 * 1024;
+        assert_eq!(protocol_resume_offset(five_gib, five_gib).unwrap(), u32::MAX);
+        assert!(protocol_resume_offset(five_gib + 1, five_gib).is_err());
     }
 }

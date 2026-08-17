@@ -1,5 +1,6 @@
 use crate::{
-    peer_from_login_response, pull_file, push_file, recv_raw, respond_to_test_delay, send_msg,
+    file_resume_supported, is_transfer_disconnected, peer_from_login_response, pull_file,
+    push_file, recv_raw, respond_to_test_delay, send_msg, transfer_disconnect_progress,
 };
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -482,7 +483,7 @@ pub(crate) async fn file_session_loop(
                 };
                 last_operation = time::Instant::now();
                 match result {
-                    Ok(()) => {
+                    Ok(stats) => {
                         write_json_line(&serde_json::json!({
                             "ok": true,
                             "operation": request.operation,
@@ -491,10 +492,28 @@ pub(crate) async fn file_session_loop(
                             "platform": peer.platform,
                             "local_path": request.local_path,
                             "remote_path": request.remote_path,
+                            "bytes": stats.bytes,
+                            "resumed": stats.resumed_from > 0,
+                            "resumed_from": stats.resumed_from,
                             "stage": "transfer_completed"
                         }))?;
                     }
                     Err(error) => {
+                        let resume_supported = file_resume_supported(&peer.version);
+                        let disconnected = is_transfer_disconnected(&error);
+                        let stage = if disconnected {
+                            "session_disconnected"
+                        } else {
+                            "transfer_failed"
+                        };
+                        let progress_bytes = if request.operation == "pull" {
+                            std::fs::metadata(format!("{}.download", request.local_path))
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0)
+                        } else {
+                            transfer_disconnect_progress(&error).unwrap_or(0)
+                        };
+                        let partial_preserved = resume_supported && progress_bytes > 0;
                         write_json_line(&serde_json::json!({
                             "ok": false,
                             "operation": request.operation,
@@ -503,10 +522,13 @@ pub(crate) async fn file_session_loop(
                             "platform": peer.platform,
                             "local_path": request.local_path,
                             "remote_path": request.remote_path,
-                            "stage": "session_disconnected",
+                            "stage": stage,
                             "error": format!("{error:#}"),
                             "replayed": false,
-                            "reconnect_on_next_call": true
+                            "resume_supported": resume_supported,
+                            "partial_preserved": partial_preserved,
+                            "progress_bytes": progress_bytes,
+                            "reconnect_on_next_call": disconnected
                         }))?;
                         return Err(error);
                     }
