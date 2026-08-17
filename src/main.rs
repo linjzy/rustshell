@@ -17,6 +17,11 @@ use hbb_common::{
 use sha2::{Digest, Sha256};
 use std::{io::Write, path::PathBuf, time::Duration};
 
+mod mcp;
+mod remote_session;
+
+use remote_session::{command_session_loop, execute_command, file_session_loop, ExecResult};
+
 const APP_NAME: &str = "RustShell";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FILE_JOB_ID: i32 = 1;
@@ -47,10 +52,32 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run one bounded command and print a structured JSON result.
+    Exec {
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        command: String,
+    },
+    /// Keep one authenticated terminal connection open and exchange JSON lines on stdio.
+    #[command(hide = true)]
+    Session,
+    /// Keep one authenticated file-transfer connection open and exchange JSON lines on stdio.
+    #[command(hide = true)]
+    FileSession,
     /// Upload one local file to an exact path on the remote device.
     Push { local: PathBuf, remote: String },
     /// Download one remote file to an exact path on this device.
     Pull { remote: String, local: PathBuf },
+    /// Serve RustDesk tools over MCP stdio using the local wrapper for configuration.
+    Mcp {
+        #[arg(long)]
+        wrapper: Option<PathBuf>,
+    },
+}
+
+enum RunOutcome {
+    Completed,
+    Command(ExecResult),
 }
 
 // ── Crypto helpers ─────────────────────────────────────────────────
@@ -95,7 +122,7 @@ fn key_event_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
         KeyCode::Char(c) => {
             if ctrl {
                 let c_lower = c.to_ascii_lowercase();
-                if ('a'..='z').contains(&c_lower) { vec![(c_lower as u8) - b'a' + 1] }
+                if c_lower.is_ascii_lowercase() { vec![(c_lower as u8) - b'a' + 1] }
                 else {
                     match c_lower {
                         '[' => vec![0x1b], ']' => vec![0x1d],
@@ -239,6 +266,20 @@ fn main() {
 
     let mut args = Args::parse();
 
+    if let Some(Command::Mcp { wrapper }) = &args.command {
+        let wrapper = wrapper
+            .clone()
+            .or_else(|| std::env::var_os("RUSTSHELL_WRAPPER").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("rustshell.sh"));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all().build().expect("tokio runtime");
+        if let Err(error) = rt.block_on(mcp::serve(wrapper)) {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Fill empty fields from RUSTSHELL_* environment variables
     if args.id.is_empty() { args.id = std::env::var("RUSTSHELL_ID").unwrap_or_default(); }
     if args.server.is_empty() { args.server = std::env::var("RUSTSHELL_SERVER").unwrap_or_default(); }
@@ -268,10 +309,20 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all().build().expect("tokio runtime");
 
-    if let Err(e) = rt.block_on(run(args.id, args.key, args.server, args.port, password, args.quit_key, args.command)) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        eprintln!("Error: {:#}", e);
-        std::process::exit(1);
+    match rt.block_on(run(args.id, args.key, args.server, args.port, password, args.quit_key, args.command)) {
+        Ok(RunOutcome::Completed) => {}
+        Ok(RunOutcome::Command(result)) => {
+            println!("{}", serde_json::to_string(&result).expect("serialize command result"));
+            if result.exit_code != 0 {
+                let exit_code = if (1..=255).contains(&result.exit_code) { result.exit_code } else { 1 };
+                std::process::exit(exit_code);
+            }
+        }
+        Err(e) => {
+            let _ = crossterm::terminal::disable_raw_mode();
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -280,8 +331,9 @@ async fn run(
     server: String, port: u16, password: String,
     quit_key: char,
     command: Option<Command>,
-) -> Result<()> {
-    let conn_type = if command.is_some() { ConnType::FILE_TRANSFER } else { ConnType::TERMINAL };
+) -> Result<RunOutcome> {
+    let file_transfer = matches!(command.as_ref(), Some(Command::Push { .. } | Command::Pull { .. } | Command::FileSession));
+    let conn_type = if file_transfer { ConnType::FILE_TRANSFER } else { ConnType::TERMINAL };
     let rendezvous_addr = format!("{}:{}", server, port);
     log::info!("Connecting to rendezvous server {}...", rendezvous_addr);
 
@@ -430,7 +482,7 @@ async fn run(
     lr.my_id = format!("RustShell-{}", std::process::id());
     lr.version = VERSION.to_owned();
     lr.my_platform = std::env::consts::OS.to_owned();
-    if command.is_some() {
+    if file_transfer {
         lr.set_file_transfer(FileTransfer::new());
     } else {
         let mut terminal = Terminal::new();
@@ -451,13 +503,42 @@ async fn run(
     );
 
     match command {
-        None => terminal_io_loop(&mut conn, &peer.platform, quit_key).await,
+        None => {
+            terminal_io_loop(&mut conn, &peer.platform, quit_key).await?;
+            Ok(RunOutcome::Completed)
+        }
+        Some(Command::Exec { timeout, command }) => {
+            let captured = execute_command(&mut conn, &peer.platform, &command, Duration::from_secs(timeout)).await?;
+            Ok(RunOutcome::Command(ExecResult {
+                ok: captured.exit_code == 0,
+                operation: "exec",
+                device_id,
+                hostname: peer.hostname,
+                platform: peer.platform,
+                exit_code: captured.exit_code,
+                stdout: captured.stdout,
+                stderr: captured.stderr,
+                duration_ms: captured.duration_ms,
+                stage: "command_completed",
+            }))
+        }
+        Some(Command::Session) => {
+            command_session_loop(&mut conn, &device_id, &peer).await?;
+            Ok(RunOutcome::Completed)
+        }
+        Some(Command::FileSession) => {
+            file_session_loop(&mut conn, &device_id, &peer).await?;
+            Ok(RunOutcome::Completed)
+        }
         Some(Command::Push { local, remote }) => {
-            push_file(&mut conn, local, remote, &peer.version).await
+            push_file(&mut conn, local, remote, &peer.version).await?;
+            Ok(RunOutcome::Completed)
         }
         Some(Command::Pull { remote, local }) => {
-            pull_file(&mut conn, remote, local, &peer.version).await
+            pull_file(&mut conn, remote, local, &peer.version).await?;
+            Ok(RunOutcome::Completed)
         }
+        Some(Command::Mcp { .. }) => unreachable!("MCP is handled before remote validation"),
     }
 }
 
@@ -1020,5 +1101,30 @@ mod tests {
             }
             _ => panic!("expected pull command"),
         }
+    }
+
+    #[test]
+    fn parses_exec_command_and_timeout() {
+        let args = Args::try_parse_from([
+            "rustshell", "--id", "123", "--server", "example.test",
+            "exec", "--timeout", "12", "printf 'hello'",
+        ]).unwrap();
+
+        match args.command {
+            Some(Command::Exec { timeout, command }) => {
+                assert_eq!(timeout, 12);
+                assert_eq!(command, "printf 'hello'");
+            }
+            _ => panic!("expected exec command"),
+        }
+    }
+
+    #[test]
+    fn parses_mcp_without_remote_connection_options() {
+        let args = Args::try_parse_from([
+            "rustshell", "mcp", "--wrapper", "/tmp/rustshell.sh",
+        ]).unwrap();
+
+        assert!(matches!(args.command, Some(Command::Mcp { .. })));
     }
 }

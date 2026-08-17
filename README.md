@@ -27,8 +27,10 @@ cargo build --release
 rustshell [OPTIONS] [COMMAND]
 
 Commands:
+  exec <COMMAND>          Run one bounded command and print a JSON result
   push <LOCAL> <REMOTE>  Upload one file to an exact remote path
   pull <REMOTE> <LOCAL>  Download one file to an exact local path
+  mcp                     Serve RustDesk tools over MCP stdio
 
 Options:
   -i, --id <ID>              Remote device ID (required)
@@ -95,10 +97,44 @@ rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
 # Download from either platform
 rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
   pull /Users/name/Desktop/report.txt ./report.txt
+
+# Run one command with separated output and a real remote exit code
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  exec --timeout 30 "uname -a"
 ```
 
 `push` and `pull` currently transfer one regular file. Both destination
 arguments are full file paths, and an existing destination is overwritten.
+
+### MCP server
+
+RustShell includes a local stdio MCP server with four tools:
+
+- `rustdesk_list_devices`
+- `rustdesk_run_command`
+- `rustdesk_upload_file`
+- `rustdesk_download_file`
+
+Start it with a local controller wrapper. The wrapper owns RustDesk discovery
+and credentials; the MCP server never accepts credentials as tool arguments.
+
+```bash
+rustshell mcp --wrapper /absolute/path/to/rustshell.sh
+```
+
+`rustdesk_list_devices` executes the wrapper's `devices --json` operation on
+every call. It reads the live RustDesk peer files without opening a remote
+connection, so newly added, removed, or renamed devices are visible without
+restarting the MCP server.
+
+Remote operations use a per-device dual session pool. Consecutive commands
+reuse one authenticated terminal connection; consecutive uploads and downloads
+reuse a separate authenticated file-transfer connection. The two RustDesk
+connection types cannot share one underlying session. Sessions close after 300
+seconds idle and reconnect once on the next call. An operation interrupted by a
+disconnect is never replayed automatically. Tool results expose
+`session_channel`, `session_reused`, and the exact completion stage in addition
+to the authenticated device identity and operation result.
 
 ### Container image
 
@@ -153,7 +189,7 @@ local terminal                                                     remote shell
 
 ## Requirements
 
-- Rust 1.75+
+- Rust 1.88+
 - A running [RustDesk server](https://github.com/rustdesk/rustdesk-server) (hbbs + hbbr)
 - RustDesk running on the target device with terminal or file-transfer access enabled
 

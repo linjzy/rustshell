@@ -27,8 +27,10 @@ cargo build --release
 rustshell [OPTIONS] [COMMAND]
 
 命令:
+  exec <COMMAND>          执行一条有超时的命令并输出 JSON 结果
   push <LOCAL> <REMOTE>  上传一个文件到远端完整路径
   pull <REMOTE> <LOCAL>  从远端下载一个文件到本地完整路径
+  mcp                     通过 stdio 提供 RustDesk MCP 工具
 
 选项:
   -i, --id <ID>              远程设备 ID
@@ -95,10 +97,40 @@ rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
 # 从 macOS 或 Windows 下载
 rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
   pull /Users/name/Desktop/report.txt ./report.txt
+
+# 执行一条命令，分别返回输出及真实远端退出码
+rustshell -i 123456789 -s myserver.example.com -k "MyKey..." -w mypassword \
+  exec --timeout 30 "uname -a"
 ```
 
 `push` 和 `pull` 当前只传一个普通文件。目标参数必须是完整文件路径；
 目标已存在时会覆盖。
+
+### MCP 服务
+
+RustShell 内置本地 stdio MCP 服务，提供四个工具：
+
+- `rustdesk_list_devices`
+- `rustdesk_run_command`
+- `rustdesk_upload_file`
+- `rustdesk_download_file`
+
+启动时指定本机控制 wrapper。RustDesk 设备发现和凭据只由 wrapper 管理，
+MCP 工具参数不接受密码或服务器 key。
+
+```bash
+rustshell mcp --wrapper /absolute/path/to/rustshell.sh
+```
+
+`rustdesk_list_devices` 每次调用都会执行 wrapper 的 `devices --json`，
+实时读取本机 RustDesk peer 文件且不连接远端，因此新增、删除或
+改名设备后无需重启 MCP。
+
+远程操作按设备使用双通道会话池：连续命令复用一条已认证终端连接，
+连续上传和下载复用另一条已认证文件连接。两种 RustDesk 连接类型不能
+共用同一条底层会话。空闲 300 秒后会话自动关闭，下一次调用只重连一次；
+执行中断线的操作绝不自动重放。工具结果会返回 `session_channel`、
+`session_reused`、已认证设备身份、操作结果和准确完成阶段。
 
 ### 容器镜像
 
@@ -153,7 +185,7 @@ rustshell                         RustDesk 基础设施                 远程�
 
 ## 环境要求
 
-- Rust 1.75+
+- Rust 1.88+
 - 运行中的 [RustDesk 服务端](https://github.com/rustdesk/rustdesk-server) (hbbs + hbbr)
 - 目标设备上运行 RustDesk，且已开启终端或文件传输权限
 

@@ -9,11 +9,16 @@ cargo build                    # Debug build
 cargo build --release          # Release build
 cargo run -- --id <ID> --server <SERVER> --key <KEY> --password <PW>
 ./target/debug/rustshell --help
+./target/debug/rustshell mcp --wrapper /absolute/path/to/rustshell.sh
 ```
 
 ## Architecture
 
-`src/main.rs` (~550 lines) — single-file binary crate. No library, no workspace.
+- `src/main.rs` — CLI, RustDesk connection/authentication, interactive terminal, and file transfer
+- `src/remote_session.rs` — bounded commands, framed output, and persistent terminal/file session protocols
+- `src/mcp.rs` — stdio MCP tools, live device discovery, and the per-device dual session pool
+
+The project remains one binary crate with no workspace.
 
 ### Dependency tree
 
@@ -27,6 +32,8 @@ rustshell
 ├── base64     ← key decoding
 ├── uuid       ← terminal service_id generation
 ├── rpassword  ← interactive password prompt
+├── rmcp       ← official Rust MCP SDK and stdio transport
+├── serde      ← structured command and MCP results
 ├── anyhow     ← error handling
 └── tokio      ← async runtime
 ```
@@ -66,6 +73,14 @@ Phase 5: Terminal I/O
   → recv TerminalResponse::Opened
   → inject locale fix (export LANG / chcp 65001)
   → bidirectional loop: tokio::select! { conn.next(), poll_key_event(), keepalive }
+
+Bounded `exec` uses the same terminal service but frames stdout, stderr, and the
+real command exit code with a per-call random marker. MCP keeps one terminal
+session and one file-transfer session per device, reuses each channel until it
+disconnects or is idle for 300 seconds, and never replays an interrupted
+operation. MCP configuration and credentials stay in the external wrapper and
+are never MCP tool arguments. Device listing reads the live peer files and does
+not open a remote connection.
 ```
 
 ### Key design decisions

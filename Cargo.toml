@@ -1,10 +1,10 @@
 [package]
 name = "rustshell"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Cross-platform remote shell and single-file transfer client via RustDesk"
+description = "Cross-platform remote shell, command execution, file transfer, and MCP server via RustDesk"
 license = "AGPL-3.0"
-rust-version = "1.75"
+rust-version = "1.88"
 
 [dependencies]
 hbb_common = { git = "https://github.com/rustdesk/hbb_common", rev = "822701e" }
@@ -16,3 +16,7 @@ anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.21"
+rmcp = { version = "3.1.2", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
