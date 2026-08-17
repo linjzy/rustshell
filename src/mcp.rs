@@ -311,7 +311,7 @@ impl RustDeskMcp {
 impl RustDeskMcp {
     #[tool(
         name = "rustdesk_list_devices",
-        description = "Read the live RustDesk peer TOML files now and return the current saved-device list. This tool never caches results and must be called immediately before every command or transfer."
+        description = "Read the live RustDesk peer TOML files now and return the current saved-device list without opening a remote connection. Use once when resolving a target for a task; refresh only when the target changes, the user asks, matching is ambiguous, or device/session validation fails."
     )]
     async fn list_devices(&self) -> CallToolResult {
         let args = vec!["devices".to_owned(), "--json".to_owned()];
@@ -343,7 +343,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_run_command",
-        description = "Run one bounded command through the per-device reusable terminal session and return its real exit code, stdout, stderr, authenticated device identity, platform, duration, and whether the connection was reused. Call rustdesk_list_devices immediately first. The command may change remote state."
+        description = "Run one bounded command through the per-device reusable terminal session and return its real exit code, stdout, stderr, authenticated device identity, platform, duration, and whether the connection was reused. Resolve the target once at task start; do not relist before each command on the same authenticated device. The command may change remote state."
     )]
     async fn run_command(
         &self,
@@ -387,7 +387,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_upload_file",
-        description = "Upload one local regular file through the per-device reusable file-transfer session and return byte count, local SHA-256, and whether the connection was reused. Existing remote files are overwritten. Call rustdesk_list_devices immediately first."
+        description = "Upload one local regular file through the per-device reusable file-transfer session and return byte count, local SHA-256, and whether the connection was reused. Existing remote files are overwritten. Reuse the target resolved for the current task; do not relist before each transfer."
     )]
     async fn upload_file(
         &self,
@@ -434,7 +434,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_download_file",
-        description = "Download one remote regular file through the per-device reusable file-transfer session and return byte count, downloaded SHA-256, and whether the connection was reused. Existing local files are overwritten. Call rustdesk_list_devices immediately first."
+        description = "Download one remote regular file through the per-device reusable file-transfer session and return byte count, downloaded SHA-256, and whether the connection was reused. Existing local files are overwritten. Reuse the target resolved for the current task; do not relist before each transfer."
     )]
     async fn download_file(
         &self,
@@ -489,7 +489,7 @@ impl RustDeskMcp {
 #[tool_handler(
     name = "rustdesk",
     version = "0.4.0",
-    instructions = "Always call rustdesk_list_devices immediately before every other RustDesk tool and use the exact device_id returned by that fresh call. Device listing reads local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session per device. A dead or idle session reconnects on the next call. Never replay an in-flight operation after a disconnect. Never reuse a cached device list, guess a menu index, request or log credentials, silently retry, or fall back to SSH."
+    instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. A dead or idle session reconnects on the next call. Never replay an in-flight operation after a disconnect, guess a menu index, request or log credentials, silently retry, or fall back to SSH."
 )]
 impl ServerHandler for RustDeskMcp {}
 

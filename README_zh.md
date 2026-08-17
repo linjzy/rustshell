@@ -124,7 +124,9 @@ rustshell mcp --wrapper /absolute/path/to/rustshell.sh
 
 `rustdesk_list_devices` 每次调用都会执行 wrapper 的 `devices --json`，
 实时读取本机 RustDesk peer 文件且不连接远端，因此新增、删除或
-改名设备后无需重启 MCP。
+改名设备后无需重启 MCP。客户端在一个连续任务开始时解析一次目标，
+后续操作直接复用该设备 ID；只在更换目标、用户要求刷新、匹配不唯一或
+设备/会话校验失败时重新查询。
 
 远程操作按设备使用双通道会话池：连续命令复用一条已认证终端连接，
 连续上传和下载复用另一条已认证文件连接。两种 RustDesk 连接类型不能

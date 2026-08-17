@@ -125,7 +125,10 @@ rustshell mcp --wrapper /absolute/path/to/rustshell.sh
 `rustdesk_list_devices` executes the wrapper's `devices --json` operation on
 every call. It reads the live RustDesk peer files without opening a remote
 connection, so newly added, removed, or renamed devices are visible without
-restarting the MCP server.
+restarting the MCP server. Clients should resolve a target once when a task
+starts and reuse that device ID for consecutive operations; refresh the list
+only when the target changes, the user requests it, matching is ambiguous, or
+device/session validation fails.
 
 Remote operations use a per-device dual session pool. Consecutive commands
 reuse one authenticated terminal connection; consecutive uploads and downloads
