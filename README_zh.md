@@ -138,6 +138,11 @@ rustshell mcp --wrapper /absolute/path/to/rustshell.sh
 `session_reused`、`resumed_from`、`resume_reconnects`、已认证设备身份和准确完成阶段。
 上传和下载的活动传输循环都每 15 秒发送一次协议保活，避免只接收数据的下载被 relay 误判为空闲。
 
+有界命令达到截止时间时，结果使用 `stage: "command_timeout"`，返回实测
+`duration_ms`，并设置 `timed_out: true` 和 `output_complete: false`，随后关闭该终端会话。
+下一次显式调用会重新连接，超时命令绝不重放。stdout 和 stderr 只在命令完成后以一个
+已校验帧返回，因此超时时两个字段保持为空，避免把不完整数据伪装成完整输出。
+
 大文件传输没有服务端总时长限制；只在明确失败或连续 300 秒没有协议进度时
 停止。RustShell 自身版本与握手上报的 RustDesk 1.4.9 协议版本彼此独立，以便
 远端开启摘要和续传协商。协议偏移是 32 位；分片超过 4 GiB 时会从可表示的

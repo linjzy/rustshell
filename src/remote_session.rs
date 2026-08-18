@@ -13,7 +13,12 @@ use hbb_common::{
     Stream,
 };
 use serde::{Deserialize, Serialize};
-use std::{io::Write, path::PathBuf, time::Duration};
+use std::{
+    fmt,
+    io::{BufRead, Write},
+    path::PathBuf,
+    time::Duration,
+};
 
 const MAX_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_EXEC_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
@@ -39,6 +44,23 @@ pub(crate) struct CapturedCommand {
     pub(crate) stderr: String,
     pub(crate) duration_ms: u128,
 }
+
+#[derive(Debug)]
+struct CommandTimedOut {
+    timeout_seconds: u64,
+}
+
+impl fmt::Display for CommandTimedOut {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "[exec_wait_result] timeout after {} seconds",
+            self.timeout_seconds
+        )
+    }
+}
+
+impl std::error::Error for CommandTimedOut {}
 
 #[derive(Debug, Deserialize)]
 struct CommandSessionRequest {
@@ -96,7 +118,10 @@ async fn execute_command_in_open_terminal(
     loop {
         tokio::select! {
             _ = time::sleep_until(deadline) => {
-                bail!("[exec_wait_result] timeout after {} seconds", timeout.as_secs());
+                return Err(CommandTimedOut {
+                    timeout_seconds: timeout.as_secs(),
+                }
+                .into());
             }
             _ = keepalive.tick() => {
                 conn.send(&Message::new())
@@ -240,8 +265,6 @@ pub(crate) async fn command_session_loop(
     device_id: &str,
     peer: &PeerInfo,
 ) -> Result<()> {
-    use tokio::io::AsyncBufReadExt;
-
     let terminal_id = 0;
     open_command_terminal(conn, terminal_id).await?;
     write_json_line(&serde_json::json!({
@@ -254,7 +277,7 @@ pub(crate) async fn command_session_loop(
         "idle_timeout_seconds": SESSION_IDLE_TIMEOUT.as_secs()
     }))?;
 
-    let mut requests = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut requests = session_request_lines();
     let mut last_command = time::Instant::now();
     let mut keepalive = time::interval_at(
         time::Instant::now() + Duration::from_secs(15),
@@ -263,11 +286,13 @@ pub(crate) async fn command_session_loop(
 
     loop {
         tokio::select! {
-            request = requests.next_line() => {
-                let Some(request) = request.context("[session_stdin] failed to read request")? else {
+            request = requests.recv() => {
+                let Some(request) = request else {
                     close_terminal(conn, terminal_id).await.ok();
                     return Ok(());
                 };
+                let request = request.map_err(anyhow::Error::msg)
+                    .context("[session_stdin] failed to read request")?;
                 let request: CommandSessionRequest = match serde_json::from_str(&request) {
                     Ok(request) => request,
                     Err(error) => {
@@ -289,6 +314,7 @@ pub(crate) async fn command_session_loop(
                     continue;
                 }
 
+                let started = std::time::Instant::now();
                 let result = execute_command_in_open_terminal(
                     conn,
                     &peer.platform,
@@ -296,6 +322,7 @@ pub(crate) async fn command_session_loop(
                     &request.command,
                     timeout,
                 ).await;
+                let duration_ms = started.elapsed().as_millis();
                 last_command = time::Instant::now();
                 match result {
                     Ok(captured) => {
@@ -313,6 +340,12 @@ pub(crate) async fn command_session_loop(
                         })?;
                     }
                     Err(error) => {
+                        let timed_out = error.downcast_ref::<CommandTimedOut>().is_some();
+                        let stage = if timed_out {
+                            "command_timeout"
+                        } else {
+                            "session_disconnected"
+                        };
                         close_terminal(conn, terminal_id).await.ok();
                         write_json_line(&serde_json::json!({
                             "ok": false,
@@ -323,8 +356,10 @@ pub(crate) async fn command_session_loop(
                             "exit_code": -1,
                             "stdout": "",
                             "stderr": format!("{error:#}"),
-                            "duration_ms": 0,
-                            "stage": "session_disconnected",
+                            "duration_ms": duration_ms,
+                            "stage": stage,
+                            "timed_out": timed_out,
+                            "output_complete": false,
                             "replayed": false,
                             "reconnect_on_next_call": true
                         }))?;
@@ -377,6 +412,29 @@ pub(crate) async fn command_session_loop(
     }
 }
 
+type SessionRequest = std::result::Result<String, String>;
+
+fn session_request_lines() -> tokio::sync::mpsc::UnboundedReceiver<SessionRequest> {
+    spawn_line_reader(std::io::BufReader::new(std::io::stdin()))
+}
+
+fn spawn_line_reader<R>(reader: R) -> tokio::sync::mpsc::UnboundedReceiver<SessionRequest>
+where
+    R: BufRead + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            let line = line.map_err(|error| error.to_string());
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
 async fn send_terminal_data(conn: &mut Stream, terminal_id: i32, script: &[u8]) -> Result<()> {
     let mut data = script.to_vec();
     data.push(b'\r');
@@ -415,8 +473,6 @@ pub(crate) async fn file_session_loop(
     device_id: &str,
     peer: &PeerInfo,
 ) -> Result<()> {
-    use tokio::io::AsyncBufReadExt;
-
     write_json_line(&serde_json::json!({
         "type": "ready",
         "protocol": 1,
@@ -427,7 +483,7 @@ pub(crate) async fn file_session_loop(
         "idle_timeout_seconds": SESSION_IDLE_TIMEOUT.as_secs()
     }))?;
 
-    let mut requests = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut requests = session_request_lines();
     let mut last_operation = time::Instant::now();
     let mut keepalive = time::interval_at(
         time::Instant::now() + Duration::from_secs(15),
@@ -436,10 +492,12 @@ pub(crate) async fn file_session_loop(
 
     loop {
         tokio::select! {
-            request = requests.next_line() => {
-                let Some(request) = request.context("[file_session_stdin] failed to read request")? else {
+            request = requests.recv() => {
+                let Some(request) = request else {
                     return Ok(());
                 };
+                let request = request.map_err(anyhow::Error::msg)
+                    .context("[file_session_stdin] failed to read request")?;
                 let request: FileSessionRequest = match serde_json::from_str(&request) {
                     Ok(request) => request,
                     Err(error) => {
@@ -700,5 +758,28 @@ mod tests {
     fn powershell_encoding_is_utf16le_base64() {
         let encoded = encode_powershell("A");
         assert_eq!(encoded, "QQA=");
+    }
+
+    #[test]
+    fn line_reader_delivers_lines_and_closes_at_eof() {
+        let input = std::io::Cursor::new(b"first\nsecond\n".to_vec());
+        let mut lines = spawn_line_reader(input);
+
+        assert_eq!(lines.blocking_recv().unwrap().unwrap(), "first");
+        assert_eq!(lines.blocking_recv().unwrap().unwrap(), "second");
+        assert!(lines.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn command_timeout_has_a_distinct_error_type() {
+        let error = anyhow::Error::new(CommandTimedOut {
+            timeout_seconds: 12,
+        });
+
+        assert!(error.downcast_ref::<CommandTimedOut>().is_some());
+        assert_eq!(
+            error.to_string(),
+            "[exec_wait_result] timeout after 12 seconds"
+        );
     }
 }

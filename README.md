@@ -146,6 +146,14 @@ stage in addition to the authenticated device identity and operation result.
 Both active upload and download loops send a protocol keepalive every 15 seconds,
 so a receive-only download does not look idle to the relay while data is flowing.
 
+When a bounded command reaches its deadline, the result uses
+`stage: "command_timeout"`, reports the measured `duration_ms`, sets
+`timed_out: true` and `output_complete: false`, and closes that terminal session.
+The next explicit call reconnects; the timed-out command is never replayed.
+Because stdout and stderr are emitted as one verified frame only after command
+completion, both fields remain empty on timeout instead of presenting incomplete
+data as complete output.
+
 Large file transfers have no server-side total-duration limit. A transfer is
 stopped only by an explicit error or 300 seconds without protocol progress.
 RustShell reports RustDesk protocol version 1.4.9 independently from its own

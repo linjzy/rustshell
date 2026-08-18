@@ -294,8 +294,7 @@ impl RustDeskMcp {
                 ));
             }
         };
-        let disconnected =
-            value.get("stage").and_then(Value::as_str) == Some("session_disconnected");
+        let reconnect = response_requires_reconnect(&value);
         if let Some(object) = value.as_object_mut() {
             object.insert("session_reused".to_owned(), Value::Bool(reused));
             object.insert(
@@ -307,7 +306,7 @@ impl RustDeskMcp {
                 Value::String("reuse_until_disconnect_or_300s_idle".to_owned()),
             );
         }
-        if disconnected {
+        if reconnect {
             *session = None;
         }
         Ok(value)
@@ -398,6 +397,10 @@ fn file_response_can_resume(value: &Value) -> bool {
     value.get("stage").and_then(Value::as_str) == Some("session_disconnected")
         && value.get("resume_supported").and_then(Value::as_bool) == Some(true)
         && value.get("partial_preserved").and_then(Value::as_bool) == Some(true)
+}
+
+fn response_requires_reconnect(value: &Value) -> bool {
+    value.get("reconnect_on_next_call").and_then(Value::as_bool) == Some(true)
 }
 
 fn file_response_made_progress(value: &Value, last_progress: u64) -> bool {
@@ -612,7 +615,7 @@ impl RustDeskMcp {
 
 #[tool_handler(
     name = "rustdesk",
-    version = "0.5.3",
+    version = "0.5.4",
     instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. File transfers have no server-side total-duration limit and fail after 300 seconds without protocol progress; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. A confirmed file-transfer disconnect may reconnect only after measurable transferred data, up to 32 times. RustDesk's 32-bit offset can retransmit the tail after 4 GiB but must not restart the whole file; after two reconnects without a higher persisted byte count, return chunk_fallback_required so the client can use terminal plus file channels for verified chunks. Never replay a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
 )]
 impl ServerHandler for RustDeskMcp {}
@@ -708,6 +711,18 @@ mod tests {
         let value = truncate_text("x".repeat(MAX_ERROR_BYTES + 10));
         assert!(value.ends_with("...<truncated>"));
         assert!(value.len() < MAX_ERROR_BYTES + 32);
+    }
+
+    #[test]
+    fn reconnect_policy_uses_the_explicit_response_flag() {
+        assert!(response_requires_reconnect(&json!({
+            "stage": "command_timeout",
+            "reconnect_on_next_call": true
+        })));
+        assert!(!response_requires_reconnect(&json!({
+            "stage": "command_completed",
+            "reconnect_on_next_call": false
+        })));
     }
 
     #[test]
