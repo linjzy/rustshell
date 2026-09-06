@@ -137,8 +137,10 @@ device/session validation fails.
 Remote operations use a per-device dual session pool. Consecutive commands
 reuse one authenticated terminal connection; consecutive uploads and downloads
 reuse a separate authenticated file-transfer connection. The two RustDesk
-connection types cannot share one underlying session. Sessions close after 300
-seconds idle and reconnect once on the next call. A terminal command interrupted
+connection types cannot share one underlying session. Calls for the same device
+and channel must be sequential because they share one session. Sessions close
+after 300 seconds idle and reconnect once on the next call. Repeated startup failures for the same device and channel are cooled down for 10 seconds to avoid retry storms. A terminal command
+interrupted
 by a disconnect is never replayed. A file transfer on RustDesk 1.4.2 or newer
 keeps its partial data and resumes at the confirmed byte offset after a
 mid-transfer disconnect, with at most 32 automatic reconnects per tool call and
@@ -158,8 +160,11 @@ Because stdout and stderr are emitted as one verified frame only after command
 completion, both fields remain empty on timeout instead of presenting incomplete
 data as complete output.
 
-Large file transfers have no server-side total-duration limit. A transfer is
-stopped only by an explicit error or 300 seconds without protocol progress.
+Large file transfers have no server-side total-duration limit. Before the first
+confirmed data progress, a transfer stops after 45 seconds without protocol
+progress; once data has started, the idle window is 300 seconds. This detects a
+file channel that never produces bytes quickly while preserving the longer
+window needed by large and resumable transfers.
 RustShell reports RustDesk protocol version 1.4.9 independently from its own
 application version so that the peer enables digest and resume negotiation.
 The protocol offset is 32-bit; for partial files beyond 4 GiB, resume safely

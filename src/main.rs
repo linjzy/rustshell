@@ -27,6 +27,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUSTDESK_PROTOCOL_VERSION: &str = "1.4.9";
 const FILE_JOB_ID: i32 = 1;
 const FILE_RESUME_MIN_VERSION: &str = "1.4.2";
+const TRANSFER_INITIAL_TIMEOUT: Duration = Duration::from_secs(45);
 const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
@@ -74,6 +75,14 @@ fn disconnected_during(
         attempt_bytes,
     }
     .into()
+}
+
+fn transfer_idle_timeout(attempt_bytes: u64) -> Duration {
+    if attempt_bytes == 0 {
+        TRANSFER_INITIAL_TIMEOUT
+    } else {
+        TRANSFER_IDLE_TIMEOUT
+    }
 }
 
 pub(crate) fn is_transfer_disconnected(error: &anyhow::Error) -> bool {
@@ -717,7 +726,7 @@ async fn push_file(
     let mut ticker = time::interval(Duration::from_millis(1));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut transferred = 0;
-    let mut finished_size = 0;
+    let mut finished_size = 0_u64;
     let mut resumed_from = 0;
     let mut last_progress = time::Instant::now();
     let mut local_done = false;
@@ -794,10 +803,15 @@ async fn push_file(
                         finished_size.saturating_sub(resumed_from),
                     ))?;
             }
-            _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
+            _ = time::sleep_until(last_progress + transfer_idle_timeout(
+                finished_size.saturating_sub(resumed_from),
+            )) => {
                 return Err(disconnected_during(
                     "push",
-                    format!("made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs()),
+                    format!(
+                        "made no progress for {} seconds",
+                        transfer_idle_timeout(finished_size.saturating_sub(resumed_from)).as_secs()
+                    ),
                     finished_size,
                     finished_size.saturating_sub(resumed_from),
                 ));
@@ -1130,10 +1144,13 @@ async fn pull_file_loop(
                         attempt_bytes,
                     ))?;
             }
-            _ = time::sleep_until(last_progress + TRANSFER_IDLE_TIMEOUT) => {
+            _ = time::sleep_until(last_progress + transfer_idle_timeout(attempt_bytes)) => {
                 return Err(disconnected_during(
                     "pull",
-                    format!("made no progress for {} seconds", TRANSFER_IDLE_TIMEOUT.as_secs()),
+                    format!(
+                        "made no progress for {} seconds",
+                        transfer_idle_timeout(attempt_bytes).as_secs()
+                    ),
                     job.finished_size(),
                     attempt_bytes,
                 ));
@@ -1404,6 +1421,12 @@ mod tests {
         assert_eq!(transfer_disconnect_attempt_bytes(&progressed), Some(0));
         let attempted = disconnected_during("pull", "connection closed", 42, 7);
         assert_eq!(transfer_disconnect_attempt_bytes(&attempted), Some(7));
+    }
+
+    #[test]
+    fn transfer_timeout_gives_dead_connections_a_short_startup_window() {
+        assert_eq!(transfer_idle_timeout(0), TRANSFER_INITIAL_TIMEOUT);
+        assert_eq!(transfer_idle_timeout(1), TRANSFER_IDLE_TIMEOUT);
     }
 
     #[test]

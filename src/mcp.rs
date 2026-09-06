@@ -12,26 +12,34 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
+    task::JoinHandle,
 };
 
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 const MAX_EXEC_TIMEOUT_SECONDS: u64 = 300;
 const MAX_FILE_RESUME_RECONNECTS: usize = 32;
 const MAX_SAME_HIGH_WATER_RECONNECTS: usize = 2;
+const SESSION_START_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct RustDeskMcp {
     wrapper: Arc<PathBuf>,
     sessions: Arc<Mutex<HashMap<(SessionChannel, String), SessionSlot>>>,
+    start_failures: Arc<Mutex<HashMap<(SessionChannel, String), StartFailure>>>,
 }
 
 type SessionSlot = Arc<Mutex<Option<SessionProcess>>>;
+
+struct StartFailure {
+    retry_after: Instant,
+    error: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum SessionChannel {
@@ -59,6 +67,7 @@ struct SessionProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
+    _stderr_task: JoinHandle<()>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -102,6 +111,7 @@ impl RustDeskMcp {
         Self {
             wrapper: Arc::new(wrapper),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            start_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -151,7 +161,7 @@ impl RustDeskMcp {
             .args([channel.wrapper_action(), device_id])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         let mut child = command
@@ -165,39 +175,95 @@ impl RustDeskMcp {
             .stdout
             .take()
             .ok_or_else(|| format!("{} session has no stdout", channel.name()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("{} session has no stderr", channel.name()))?;
+        let stderr_capture = Arc::new(Mutex::new(String::new()));
+        let capture = Arc::clone(&stderr_capture);
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut captured = capture.lock().await;
+                if captured.len() < MAX_ERROR_BYTES {
+                    captured.push_str(&line);
+                    captured.push('\n');
+                    if captured.len() > MAX_ERROR_BYTES {
+                        *captured = truncate_text(std::mem::take(&mut *captured));
+                    }
+                }
+            }
+        });
         let mut stdout = BufReader::new(stdout).lines();
-        let ready = tokio::time::timeout(Duration::from_secs(45), stdout.next_line())
-            .await
-            .map_err(|_| {
-                format!(
-                    "{} session did not become ready in 45 seconds",
-                    channel.name()
+        let ready = match tokio::time::timeout(Duration::from_secs(45), stdout.next_line()).await {
+            Err(_) => {
+                return Err(startup_failure(
+                    child,
+                    stderr_task,
+                    stderr_capture,
+                    format!(
+                        "{} session did not become ready in 45 seconds",
+                        channel.name()
+                    ),
                 )
-            })?
-            .map_err(|error| {
-                format!(
-                    "failed to read {} session readiness: {error}",
-                    channel.name()
+                .await)
+            }
+            Ok(Err(error)) => {
+                return Err(startup_failure(
+                    child,
+                    stderr_task,
+                    stderr_capture,
+                    format!(
+                        "failed to read {} session readiness: {error}",
+                        channel.name()
+                    ),
                 )
-            })?
-            .ok_or_else(|| format!("{} session exited before becoming ready", channel.name()))?;
-        let ready: Value = serde_json::from_str(&ready).map_err(|error| {
-            format!("invalid {} session readiness JSON: {error}", channel.name())
-        })?;
+                .await)
+            }
+            Ok(Ok(None)) => {
+                return Err(startup_failure(
+                    child,
+                    stderr_task,
+                    stderr_capture,
+                    format!("{} session exited before becoming ready", channel.name()),
+                )
+                .await)
+            }
+            Ok(Ok(Some(ready))) => ready,
+        };
+        let ready: Value = match serde_json::from_str(&ready) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(startup_failure(
+                    child,
+                    stderr_task,
+                    stderr_capture,
+                    format!("invalid {} session readiness JSON: {error}", channel.name()),
+                )
+                .await)
+            }
+        };
         if ready.get("type").and_then(Value::as_str) != Some("ready")
             || ready.get("channel").and_then(Value::as_str) != Some(channel.name())
             || ready.get("device_id").and_then(Value::as_str) != Some(device_id)
         {
-            return Err(format!(
-                "{} session readiness did not match device {device_id}",
-                channel.name()
-            ));
+            return Err(startup_failure(
+                child,
+                stderr_task,
+                stderr_capture,
+                format!(
+                    "{} session readiness did not match device {device_id}",
+                    channel.name()
+                ),
+            )
+            .await);
         }
 
         Ok(SessionProcess {
             child,
             stdin,
             stdout,
+            _stderr_task: stderr_task,
         })
     }
 
@@ -226,7 +292,41 @@ impl RustDeskMcp {
             }
         }
         if session.is_none() {
-            *session = Some(self.start_session(channel, device_id).await?);
+            let failure_key = (channel, device_id.to_owned());
+            {
+                let mut failures = self.start_failures.lock().await;
+                if let Some(failure) = failures.get(&failure_key) {
+                    if failure.retry_after > Instant::now() {
+                        let remaining = failure
+                            .retry_after
+                            .saturating_duration_since(Instant::now())
+                            .as_secs_f64();
+                        return Err(format!(
+                            "{} session startup retry suppressed for {:.1}s after previous failure: {}",
+                            channel.name(),
+                            remaining,
+                            failure.error
+                        ));
+                    }
+                    failures.remove(&failure_key);
+                }
+            }
+            match self.start_session(channel, device_id).await {
+                Ok(process) => {
+                    self.start_failures.lock().await.remove(&failure_key);
+                    *session = Some(process);
+                }
+                Err(error) => {
+                    self.start_failures.lock().await.insert(
+                        failure_key,
+                        StartFailure {
+                            retry_after: Instant::now() + SESSION_START_FAILURE_COOLDOWN,
+                            error: error.clone(),
+                        },
+                    );
+                    return Err(error);
+                }
+            }
         }
 
         let process = session.as_mut().expect("session initialized");
@@ -393,6 +493,23 @@ impl RustDeskMcp {
     }
 }
 
+async fn startup_failure(
+    mut child: Child,
+    stderr_task: JoinHandle<()>,
+    stderr_capture: Arc<Mutex<String>>,
+    reason: String,
+) -> String {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), stderr_task).await;
+    let stderr = stderr_capture.lock().await.trim().to_owned();
+    if stderr.is_empty() {
+        reason
+    } else {
+        format!("{reason}; wrapper stderr: {}", truncate_text(stderr))
+    }
+}
+
 fn file_response_can_resume(value: &Value) -> bool {
     value.get("stage").and_then(Value::as_str) == Some("session_disconnected")
         && value.get("resume_supported").and_then(Value::as_bool) == Some(true)
@@ -521,7 +638,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_upload_file",
-        description = "Upload one local regular file, including large files, through the per-device reusable file-transfer session and return byte count, local SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file; two reconnects without a higher persisted byte count return chunk_fallback_required instead of looping. Existing remote files are overwritten. Reuse the target resolved for the current task."
+        description = "Upload one local regular file, including large files, through the per-device reusable file-transfer session and return byte count, local SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; before the first confirmed data progress the transfer stops after 45 seconds without protocol progress, and after progress starts it stops after 300 seconds of idle time. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file; two reconnects without a higher persisted byte count return chunk_fallback_required instead of looping. Existing remote files are overwritten. Reuse the target resolved for the current task."
     )]
     async fn upload_file(
         &self,
@@ -579,7 +696,7 @@ impl RustDeskMcp {
 
     #[tool(
         name = "rustdesk_download_file",
-        description = "Download one remote regular file, including large files, through the per-device reusable file-transfer session and return byte count, SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; the transfer stops after 300 seconds without protocol progress. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times; if stalled or exhausted, the partial file remains resumable on the next call. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file; two reconnects without a higher persisted byte count return chunk_fallback_required instead of looping. Existing local files are overwritten. Reuse the target resolved for the current task."
+        description = "Download one remote regular file, including large files, through the per-device reusable file-transfer session and return byte count, SHA-256, resume offset, and connection reuse details. There is no server-side total-duration limit; before the first confirmed data progress the transfer stops after 45 seconds without protocol progress, and after progress starts it stops after 300 seconds of idle time. A confirmed mid-transfer disconnect reconnects only when that connection transferred data, up to 32 times; if stalled or exhausted, the partial file remains resumable on the next call. RustDesk's 32-bit resume offset can retransmit the tail after 4 GiB, but never restarts the whole file; two reconnects without a higher persisted byte count return chunk_fallback_required instead of looping. Existing local files are overwritten. Reuse the target resolved for the current task."
     )]
     async fn download_file(
         &self,
@@ -631,8 +748,8 @@ impl RustDeskMcp {
 
 #[tool_handler(
     name = "rustdesk",
-    version = "0.5.7",
-    instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. File transfers have no server-side total-duration limit and fail after 300 seconds without protocol progress; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. A confirmed file-transfer disconnect may reconnect only after measurable transferred data, up to 32 times. RustDesk's 32-bit offset can retransmit the tail after 4 GiB but must not restart the whole file; after two reconnects without a higher persisted byte count, return chunk_fallback_required so the client can use terminal plus file channels for verified chunks. Never replay a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
+    version = "0.5.8",
+    instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. Calls for the same device_id and channel must be made sequentially because they share one session; do not issue concurrent commands or transfers for the same device. File transfers have no server-side total-duration limit: before first data progress they fail after 45 seconds without protocol progress, and after progress starts they fail after 300 seconds of idle time; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. Repeated session startup failures for the same device and channel are suppressed for 10 seconds to avoid retry storms. A confirmed file-transfer disconnect may reconnect only after measurable transferred data, up to 32 times. RustDesk's 32-bit offset can retransmit the tail after 4 GiB but must not restart the whole file; after two reconnects without a higher persisted byte count, return chunk_fallback_required so the client can use terminal plus file channels for verified chunks. Never replay a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
 )]
 impl ServerHandler for RustDeskMcp {}
 
