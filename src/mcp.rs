@@ -400,7 +400,10 @@ fn file_response_can_resume(value: &Value) -> bool {
 }
 
 fn response_requires_reconnect(value: &Value) -> bool {
-    value.get("reconnect_on_next_call").and_then(Value::as_bool) == Some(true)
+    value
+        .get("reconnect_on_next_call")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| value.get("stage").and_then(Value::as_str) == Some("session_disconnected"))
 }
 
 fn file_response_made_progress(value: &Value, last_progress: u64) -> bool {
@@ -553,6 +556,19 @@ impl RustDeskMcp {
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             return CallToolResult::structured_error(value);
         }
+        let (verified_bytes, verified_sha256) = match file_fingerprint(&local_path) {
+            Ok(value) => value,
+            Err(error) => return tool_error("verify_local_file", error),
+        };
+        if verified_bytes != bytes || verified_sha256 != sha256 {
+            return tool_error(
+                "local_changed_during_transfer",
+                format!(
+                    "local file changed while uploading: {}",
+                    local_path.display()
+                ),
+            );
+        }
         if let Some(object) = value.as_object_mut() {
             object.insert("bytes".to_owned(), Value::from(bytes));
             object.insert("sha256".to_owned(), Value::String(sha256));
@@ -615,7 +631,7 @@ impl RustDeskMcp {
 
 #[tool_handler(
     name = "rustdesk",
-    version = "0.5.4",
+    version = "0.5.5",
     instructions = "Call rustdesk_list_devices once when a task first resolves a RustDesk target, then reuse that exact device_id and its authenticated sessions for subsequent operations on the same target without relisting. Refresh only when the target changes, the user requests it, matching is ambiguous, a new unrelated task starts, or device/session validation fails. Device listing reads live local peer files and does not connect. Commands reuse one terminal session per device; uploads and downloads reuse a separate file-transfer session. File transfers have no server-side total-duration limit and fail after 300 seconds without protocol progress; configure the MCP client timeout high enough for the file size. A dead or idle session reconnects on the next call. A confirmed file-transfer disconnect may reconnect only after measurable transferred data, up to 32 times. RustDesk's 32-bit offset can retransmit the tail after 4 GiB but must not restart the whole file; after two reconnects without a higher persisted byte count, return chunk_fallback_required so the client can use terminal plus file channels for verified chunks. Never replay a terminal command, guess a menu index, request or log credentials, silently retry non-connection errors or zero-progress transfers, or fall back to SSH."
 )]
 impl ServerHandler for RustDeskMcp {}
@@ -681,10 +697,17 @@ fn session_error(stage: &str, message: impl Into<String>) -> CallToolResult {
 }
 
 fn truncate_text(mut value: String) -> String {
-    if value.len() > MAX_ERROR_BYTES {
-        value.truncate(MAX_ERROR_BYTES);
-        value.push_str("...<truncated>");
+    if value.len() <= MAX_ERROR_BYTES {
+        return value;
     }
+
+    const SUFFIX: &str = "...<truncated>";
+    let mut end = MAX_ERROR_BYTES.saturating_sub(SUFFIX.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(SUFFIX);
     value
 }
 
@@ -714,6 +737,14 @@ mod tests {
     }
 
     #[test]
+    fn truncates_large_utf8_errors_without_panicking() {
+        let value = truncate_text("错误".repeat(MAX_ERROR_BYTES));
+        assert!(value.ends_with("...<truncated>"));
+        assert!(value.is_char_boundary(value.len()));
+        assert!(value.len() <= MAX_ERROR_BYTES);
+    }
+
+    #[test]
     fn reconnect_policy_uses_the_explicit_response_flag() {
         assert!(response_requires_reconnect(&json!({
             "stage": "command_timeout",
@@ -722,6 +753,9 @@ mod tests {
         assert!(!response_requires_reconnect(&json!({
             "stage": "command_completed",
             "reconnect_on_next_call": false
+        })));
+        assert!(response_requires_reconnect(&json!({
+            "stage": "session_disconnected"
         })));
     }
 

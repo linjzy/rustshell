@@ -717,12 +717,8 @@ fn parse_command_frame(data: &[u8], marker: &str) -> Result<Option<(i32, String,
         let Ok(exit_code) = exit_code.parse::<i32>() else {
             continue;
         };
-        let stdout = base64::engine::general_purpose::STANDARD
-            .decode(stdout)
-            .context("[exec_parse] invalid stdout encoding")?;
-        let stderr = base64::engine::general_purpose::STANDARD
-            .decode(stderr)
-            .context("[exec_parse] invalid stderr encoding")?;
+        let stdout = decode_base64_field(stdout, "[exec_parse] invalid stdout encoding")?;
+        let stderr = decode_base64_field(stderr, "[exec_parse] invalid stderr encoding")?;
         return Ok(Some((
             exit_code,
             String::from_utf8_lossy(&stdout).into_owned(),
@@ -730,6 +726,67 @@ fn parse_command_frame(data: &[u8], marker: &str) -> Result<Option<(i32, String,
         )));
     }
     Ok(None)
+}
+
+fn decode_base64_field(value: &str, context: &'static str) -> Result<Vec<u8>> {
+    let compact = strip_terminal_controls(value)
+        .into_iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .context(context)
+}
+
+fn strip_terminal_controls(value: &str) -> Vec<u8> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+
+    let mut state = State::Normal;
+    let mut result = Vec::with_capacity(value.len());
+    for byte in value.bytes() {
+        state = match state {
+            State::Normal => match byte {
+                0x1b => State::Escape,
+                0x00..=0x08 | 0x0b..=0x0c | 0x0e..=0x1f | 0x7f => State::Normal,
+                _ => {
+                    result.push(byte);
+                    State::Normal
+                }
+            },
+            State::Escape => match byte {
+                b'[' => State::Csi,
+                b']' => State::Osc,
+                _ => State::Normal,
+            },
+            State::Csi => {
+                if (0x40..=0x7e).contains(&byte) {
+                    State::Normal
+                } else {
+                    State::Csi
+                }
+            }
+            State::Osc => match byte {
+                0x07 => State::Normal,
+                0x1b => State::OscEscape,
+                _ => State::Osc,
+            },
+            State::OscEscape => {
+                if byte == b'\\' {
+                    State::Normal
+                } else {
+                    State::Osc
+                }
+            }
+        };
+    }
+    result
 }
 
 #[cfg(test)]
@@ -758,6 +815,36 @@ mod tests {
     fn powershell_encoding_is_utf16le_base64() {
         let encoded = encode_powershell("A");
         assert_eq!(encoded, "QQA=");
+    }
+
+    #[test]
+    fn parses_base64_fields_with_terminal_wrapping_whitespace() {
+        let marker = "__RUSTSHELL_RESULT_wrapped__";
+        let frame = format!(
+            "{marker}:7:aGVs\n bG8=:Ym\r\nFk:END\r\n"
+        );
+        let parsed = parse_command_frame(frame.as_bytes(), marker)
+            .unwrap()
+            .expect("frame");
+
+        assert_eq!(parsed.0, 7);
+        assert_eq!(parsed.1, "hello");
+        assert_eq!(parsed.2, "bad");
+    }
+
+    #[test]
+    fn parses_base64_fields_with_conpty_cursor_controls() {
+        let marker = "__RUSTSHELL_RESULT_conpty__";
+        let frame = format!(
+            "{marker}:7:aGVs\u{8}\u{1b}[?25h\u{1b}[?25l bG8=:YmFk:END\r\n"
+        );
+        let parsed = parse_command_frame(frame.as_bytes(), marker)
+            .unwrap()
+            .expect("frame");
+
+        assert_eq!(parsed.0, 7);
+        assert_eq!(parsed.1, "hello");
+        assert_eq!(parsed.2, "bad");
     }
 
     #[test]
