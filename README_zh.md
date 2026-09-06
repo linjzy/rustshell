@@ -118,6 +118,10 @@ RustShell 内置本地 stdio MCP 服务，提供四个工具：
 启动时指定本机控制 wrapper。RustDesk 设备发现和凭据只由 wrapper 管理，
 MCP 工具参数不接受密码或服务器 key。
 
+wrapper 需要把 `devices --json`、`session DEVICE_ID` 和
+`file-session DEVICE_ID` 分别转发给 RustShell；最后一个动作是上传和下载
+工具建立文件通道所必需的。缺少该转发时，文件工具会在会话就绪前失败。
+
 ```bash
 rustshell mcp --wrapper /absolute/path/to/rustshell.sh
 ```

@@ -117,6 +117,10 @@ RustShell includes a local stdio MCP server with four tools:
 
 Start it with a local controller wrapper. The wrapper owns RustDesk discovery
 and credentials; the MCP server never accepts credentials as tool arguments.
+The wrapper must forward `devices --json`, `session DEVICE_ID`, and
+`file-session DEVICE_ID` to RustShell. The `file-session` action is required by
+the upload and download tools; without it, file calls fail before session
+readiness.
 
 ```bash
 rustshell mcp --wrapper /absolute/path/to/rustshell.sh
