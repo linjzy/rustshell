@@ -650,18 +650,7 @@ fn posix_single_quote(value: &str) -> String {
 
 fn windows_command_script(command: &str, marker: &str) -> String {
     let command_base64 = base64::engine::general_purpose::STANDARD.encode(command.as_bytes());
-    let user_script = format!(
-        "$ErrorActionPreference='Continue'; $ProgressPreference='SilentlyContinue'; \
-         $__rs_utf8=New-Object Text.UTF8Encoding $false; \
-         [Console]::OutputEncoding=$__rs_utf8; [Console]::InputEncoding=$__rs_utf8; \
-         $OutputEncoding=$__rs_utf8; \
-         $global:LASTEXITCODE=$null; \
-         $__rs_cmd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{command_base64}')); \
-         try {{ & ([ScriptBlock]::Create($__rs_cmd)); \
-         if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }}; \
-         if ($?) {{ exit 0 }} else {{ exit 1 }} }} \
-         catch {{ [Console]::Error.WriteLine($_.ToString()); exit 1 }}"
-    );
+    let user_script = windows_user_script(&command_base64);
     let encoded_user_script = encode_powershell(&user_script);
     let outer_script = format!(
         "$ErrorActionPreference='Continue'; \
@@ -685,6 +674,23 @@ fn windows_command_script(command: &str, marker: &str) -> String {
     format!(
         "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
         encode_powershell(&outer_script)
+    )
+}
+
+fn windows_user_script(command_base64: &str) -> String {
+    format!(
+        "$ErrorActionPreference='Continue'; $ProgressPreference='SilentlyContinue'; \
+         $__rs_utf8=New-Object Text.UTF8Encoding $false; \
+         [Console]::OutputEncoding=$__rs_utf8; [Console]::InputEncoding=$__rs_utf8; \
+         $OutputEncoding=$__rs_utf8; \
+         $global:LASTEXITCODE=$null; \
+         $Error.Clear(); \
+         $__rs_cmd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{command_base64}')); \
+         try {{ & ([ScriptBlock]::Create($__rs_cmd)); \
+         $__rs_success=$?; $__rs_exit=$LASTEXITCODE; $__rs_had_error=$Error.Count -gt 0; \
+         if ($null -ne $__rs_exit) {{ exit $__rs_exit }}; \
+         if ($__rs_success -and -not $__rs_had_error) {{ exit 0 }} else {{ exit 1 }} }} \
+         catch {{ [Console]::Error.WriteLine($_.ToString()); exit 1 }}"
     )
 }
 
@@ -815,6 +821,15 @@ mod tests {
     fn powershell_encoding_is_utf16le_base64() {
         let encoded = encode_powershell("A");
         assert_eq!(encoded, "QQA=");
+    }
+
+    #[test]
+    fn windows_script_captures_status_before_follow_up_commands() {
+        let command_base64 = base64::engine::general_purpose::STANDARD.encode("Write-Error 'failure'");
+        let script = windows_user_script(&command_base64);
+        assert!(script.contains("$Error.Clear();"));
+        assert!(script.contains("$__rs_success=$?; $__rs_exit=$LASTEXITCODE;"));
+        assert!(script.contains("if ($__rs_success -and -not $__rs_had_error)"));
     }
 
     #[test]
